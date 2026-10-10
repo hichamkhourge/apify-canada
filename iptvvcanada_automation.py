@@ -1127,6 +1127,8 @@ def create_emailondeck_inbox():
     if IPTVV_PROXY_URL:
         http.proxies = {"http": IPTVV_PROXY_URL, "https": IPTVV_PROXY_URL}
         http.verify = False
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     try:
         page = http.get(f"{base}/", timeout=30)
         page.raise_for_status()
@@ -1166,9 +1168,13 @@ def get_emailondeck_messages(http):
         resp.raise_for_status()
         parts = resp.text.split("|<|>|", 1)
         rows_html = parts[1] if len(parts) > 1 else ""
+        if len(parts) < 2:
+            print(f"[!] emailondeck: unexpected inbox response (HTTP {resp.status_code}, "
+                  f"{len(resp.text)} bytes): {resp.text[:300]!r}")
     except Exception as exc:
         print(f"[!] Failed to fetch emailondeck inbox: {exc}")
         return []
+    count_prefix = parts[0].strip() if len(parts) > 1 else ""
     messages = []
     for tag in re.finditer(
         r"""(?is)<(\w+)\b[^>]*class=["'][^"']*msglink[^"']*["'][^>]*>(.*?)</\1>""", rows_html
@@ -1186,6 +1192,9 @@ def get_emailondeck_messages(http):
             "text": "",
             "html": [],
         })
+    if not messages and rows_html.strip():
+        # Server returned rows but the msglink regex found none: the markup changed.
+        print(f"[!] emailondeck: count={count_prefix!r} but no rows parsed; raw rows: {rows_html[:600]!r}")
     return messages
 
 
@@ -1224,6 +1233,15 @@ def _wait_for_credentials_email_emailondeck(http, max_wait_seconds=EMAIL_MAX_WAI
             print(f"[*] Found {len(messages)} email(s), but credentials email not yet received")
         else:
             print("[*] Inbox is empty")
+            if attempt == 1 or attempt % 10 == 0:
+                # Periodic raw dump to tell "truly empty" from "session/proxy broke".
+                try:
+                    raw = http.post(f"{EMAILONDECK_BASE}/ajax/messages.php",
+                                    headers={"X-Requested-With": "XMLHttpRequest"}, timeout=30)
+                    print(f"[debug] emailondeck raw inbox: HTTP {raw.status_code}, "
+                          f"{len(raw.text)} bytes, cookies={list(http.cookies.keys())}: {raw.text[:300]!r}")
+                except Exception as exc:
+                    print(f"[debug] emailondeck raw inbox fetch failed: {exc}")
         time.sleep(min(EMAIL_POLL_SECONDS, max(0, deadline - time.time())))
 
     print(f"[!] Timeout: Credentials email not received after {max_wait_seconds}s")
