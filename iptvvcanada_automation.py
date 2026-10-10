@@ -84,7 +84,7 @@ IPTVV_EMAIL_BACKEND = os.getenv("IPTVV_EMAIL_BACKEND", "mailcx").strip().lower()
 # Comma-separated; set to "" to disable fallback and fail on the primary.
 IPTVV_EMAIL_FALLBACKS = [
     b.strip().lower()
-    for b in os.getenv("IPTVV_EMAIL_FALLBACKS", "tmaily,procmail,mailtm").split(",")
+    for b in os.getenv("IPTVV_EMAIL_FALLBACKS", "gmail").split(",")
     if b.strip()
 ]
 TMAILY_API_BASE = os.getenv("TMAILY_API_BASE", "https://tmaily.com").rstrip("/")
@@ -1103,10 +1103,11 @@ def solve_hcaptcha_token(sitekey, page_url, attempts=2):
     if not TWOCAPTCHA_API_KEY:
         print("[!] TWOCAPTCHA_API_KEY is not set, cannot solve hCaptcha")
         return None
-    hsolver = TwoCaptcha(TWOCAPTCHA_API_KEY, defaultTimeout=300, pollingInterval=5)
+    hsolver = TwoCaptcha(TWOCAPTCHA_API_KEY, defaultTimeout=150, pollingInterval=5)
     for attempt in range(1, attempts + 1):
         try:
-            print(f"[*] Solving hCaptcha via 2captcha (attempt {attempt}/{attempts})...")
+            print(f"[*] Solving hCaptcha via 2captcha (attempt {attempt}/{attempts}, "
+                  f"sitekey={sitekey}, url={page_url})...")
             return hsolver.hcaptcha(sitekey=sitekey, url=page_url)["code"]
         except Exception as exc:
             print(f"[!] hCaptcha solve failed: {exc}")
@@ -2658,6 +2659,17 @@ def submit_checkout_form(driver):
                         print(f"    Error {i}: {err.text}")
             except:
                 print("[*] No error message found via CSS selectors")
+
+            # A disposable-domain rejection can never recover by waiting for mail.
+            try:
+                checkout_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+            except Exception:
+                checkout_text = ""
+            if "disposable email" in checkout_text or "temporary or disposable" in checkout_text:
+                raise TrialRejectedError(
+                    "IPTVV rejected the email address as temporary/disposable; "
+                    "use the 'gmail' backend (a permanent address)."
+                )
 
             # Check for inline field errors
             try:
