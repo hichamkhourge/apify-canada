@@ -53,11 +53,11 @@
         "emailBackend": {
             "title": "Email backend",
             "type": "string",
-            "description": "Which mailbox to use for receiving the credentials email. 'mailcx' uses api.mail.cx (requires an API token below); 'boomlify' uses the boomlify.com API (requires an API key below); 'tmaily' allocates a disposable tmaily.com inbox per run; 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
+            "description": "Which mailbox to use for receiving the credentials email. 'mailcx' uses api.mail.cx (requires an API token below); 'boomlify' uses boomlify.com's free web inbox (no key or captcha; add an API key below to use its paid API instead); 'tmaily' allocates a disposable tmaily.com inbox per run; 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
             "editor": "select",
             "default": "mailcx",
             "enum": ["mailcx", "boomlify", "tmaily", "gmail", "procmail", "mailtm"],
-            "enumTitles": ["mail.cx (default)", "boomlify.com (needs API key)", "tmaily.com", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
+            "enumTitles": ["mail.cx (default)", "boomlify.com (free)", "tmaily.com", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
         },
         "emailFallbacks": {
             "title": "Email fallback backends",
@@ -82,14 +82,14 @@
         "boomlifyApiKey": {
             "title": "Boomlify API key",
             "type": "string",
-            "description": "API key from the Boomlify dashboard. Required for the 'boomlify' backend; each inbox creation costs credits.",
+            "description": "Optional. Leave empty to use Boomlify's free web inbox. If set, the 'boomlify' backend uses the paid API instead (each inbox costs credits).",
             "editor": "textfield",
             "isSecret": true
         },
         "boomlifyEmailTime": {
             "title": "Boomlify inbox lifetime",
             "type": "string",
-            "description": "How long the Boomlify address lives. Must outlast the email wait (up to 45 min), so 10min is too short.",
+            "description": "API mode only: how long the Boomlify address lives (free web inboxes last ~2 months). Must outlast the email wait (up to 45 min), so 10min is too short.",
             "editor": "select",
             "default": "1day",
             "enum": ["10min", "1hour", "1day", "permanent"],

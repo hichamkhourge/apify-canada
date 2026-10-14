@@ -64,9 +64,9 @@ EMAIL_MAX_WAIT_SECONDS = int(os.getenv("IPTVV_EMAIL_MAX_WAIT_SECONDS", "2700")) 
 #                (MAILCX_API_TOKEN, from the mail.cx dashboard -> Tokens).
 #                GET /v1/inbox/<address> long-polls server-side for up to 25s
 #                per call, so no client-side poll loop is needed.
-#   "boomlify"        — v1.boomlify.com REST API (needs BOOMLIFY_API_KEY). Creating
-#                an address costs credits; reading messages is free. Lifetime is
-#                BOOMLIFY_EMAIL_TIME (default 1day, so it outlives the email wait).
+#   "boomlify"        — boomlify.com. By default uses the free web guest flow (no
+#                key, no captcha, ~2-month inbox). If BOOMLIFY_API_KEY is set it
+#                uses the paid REST API instead, with lifetime BOOMLIFY_EMAIL_TIME.
 #   "tmaily"          — tmaily.com same-origin REST API. GET /generate for an
 #                address (session cookie binds the inbox), GET /emails?address=
 #                for messages. Inboxes auto-expire after 24h. Addresses are
@@ -1099,31 +1099,25 @@ def _wait_for_credentials_email_gmail(alias, max_wait_seconds=EMAIL_MAX_WAIT_SEC
 
 
 # ═══════════════════════════════════════════════════════════
-# Boomlify backend — v1.boomlify.com REST API (X-API-Key auth, no captcha)
+# Boomlify backend — v1.boomlify.com, free web guest flow (no key, no captcha)
 #
-#   POST /api/v1/emails/create?time=1day -> {"email": {"id", "address", ...}}
-#   GET  /api/v1/emails/{id}/messages    -> {"messages": [{"id", "subject",
-#                                           "from_email", "body_text", "body_html", ...}]}
-#   GET  /api/v1/account/credits         -> cheap authenticated key check
-# Creating an address costs credits; reading messages is free. Responses
-# proxied through ApyHub nest the payload under "data", so both shapes parse.
+# Guest mode (default, what the boomlify.com web app does):
+#   POST /guest/init                  -> {"token": <JWT>, "isGuest": true}
+#   GET  /domains/public              -> [{"id", "domain", "is_premium", ...}]
+#   POST /emails/create               -> {"email": "x@dom", "domainId"} => {"id", "email", "expires_at"}
+#   GET  /emails/{id}/received        -> {"data": [{"id", "subject", "from_email",
+#                                         "body_text", "body_html", ...}], "metadata": {...}}
+#   Guest responses are XOR-obfuscated as {"encrypted": "<hex>"}; the key is
+#   picked by the x-enc-key-id response header from a key ring shipped in the
+#   site's main JS bundle, which is fetched at runtime so key rotations don't
+#   break us. Guest inboxes live ~2 months.
+# API mode (only when BOOMLIFY_API_KEY is set; costs credits per inbox):
+#   POST /api/v1/emails/create?time=..  GET /api/v1/emails/{id}/messages
 # ═══════════════════════════════════════════════════════════
-def _boomlify_session():
-    http = requests.Session()
-    http.headers.update({
-        "X-API-Key": BOOMLIFY_API_KEY,
-        "Accept": "application/json",
-        "User-Agent": get_random_user_agent(),
-    })
-    return http
-
-
-def _boomlify_payload(resp):
-    """Return the response body, unwrapping an ApyHub-style "data" envelope."""
-    body = resp.json()
-    if isinstance(body, dict) and isinstance(body.get("data"), dict):
-        return body["data"]
-    return body
+BOOMLIFY_WEB_BASE = "https://boomlify.com"
+# Fallback XOR key if the bundle can't be fetched/parsed.
+_BOOMLIFY_DEFAULT_KEY = "7a9b3c8d2e1f4g5h6i9j0k8l2m4n6o8p"
+_boomlify_keys_cache = None
 
 
 def _html_to_text(fragment):
@@ -1132,16 +1126,60 @@ def _html_to_text(fragment):
     return re.sub(r"\s+", " ", html.unescape(fragment)).strip()
 
 
-def verify_boomlify_key():
-    """Check BOOMLIFY_API_KEY before spending a browser session on it.
+def _boomlify_session():
+    http = requests.Session()
+    http.headers.update({
+        "Accept": "application/json",
+        "User-Agent": get_random_user_agent(),
+        "Origin": BOOMLIFY_WEB_BASE,
+        "Referer": f"{BOOMLIFY_WEB_BASE}/",
+    })
+    if BOOMLIFY_API_KEY:
+        http.headers["X-API-Key"] = BOOMLIFY_API_KEY
+    return http
 
-    Returns False if Boomlify rejects the account (401/402/403/429, e.g. bad
-    key, out of credits or daily limit hit) so the caller can fall back to
-    another backend. Raises on a missing key or network failure.
+
+def _boomlify_keys(http):
+    """Return (default_key, key_ring) scraped from boomlify.com's main JS bundle."""
+    global _boomlify_keys_cache
+    if _boomlify_keys_cache is None:
+        default, ring = _BOOMLIFY_DEFAULT_KEY, {}
+        try:
+            home = http.get(f"{BOOMLIFY_WEB_BASE}/en", timeout=30).text
+            bundle = re.search(r'src="(/assets/main\.[^"]+\.js)"', home)
+            js = http.get(f"{BOOMLIFY_WEB_BASE}{bundle.group(1)}", timeout=30).text
+            found = re.search(r'keyString="([^"]+)"', js)
+            if found:
+                default = found.group(1)
+            ring_js = re.search(r"getTransportKeyRing\(\)\{try\{const e=JSON\.parse\('(\{.*?\})'\)", js)
+            if ring_js:
+                ring = json.loads(ring_js.group(1))
+        except Exception as exc:
+            print(f"[!] Boomlify: could not load decryption keys from the site bundle ({exc}); "
+                  "using the built-in key")
+        _boomlify_keys_cache = (default, ring)
+    return _boomlify_keys_cache
+
+
+def _boomlify_payload(http, resp):
+    """Decode a Boomlify response: undo the guest XOR layer and any "data" envelope."""
+    body = resp.json()
+    if isinstance(body, dict) and "encrypted" in body:
+        default, ring = _boomlify_keys(http)
+        key = ring.get(resp.headers.get("x-enc-key-id") or "", default).encode()
+        raw = bytes.fromhex(body["encrypted"])
+        body = json.loads("".join(chr(b ^ key[i % len(key)]) for i, b in enumerate(raw)))
+    return body
+
+
+def verify_boomlify_key():
+    """Pre-flight: guest mode needs nothing; API mode checks BOOMLIFY_API_KEY.
+
+    Returns False if Boomlify rejects the key (401/402/403/429, e.g. out of
+    credits or daily limit hit) so the caller can fall back to another backend.
     """
     if not BOOMLIFY_API_KEY:
-        raise RuntimeError("BOOMLIFY_API_KEY is not set; the boomlify backend needs an API key "
-                           "from the Boomlify dashboard")
+        return True
     try:
         resp = _boomlify_session().get(f"{BOOMLIFY_API_BASE}/api/v1/account/credits", timeout=15)
     except Exception as exc:
@@ -1156,27 +1194,63 @@ def verify_boomlify_key():
     return True
 
 
-def create_boomlify_inbox():
-    """Create a Boomlify address; returns (address, email_id) or (None, None)."""
+def _create_boomlify_guest_inbox(http):
+    resp = http.post(f"{BOOMLIFY_API_BASE}/guest/init", json={}, timeout=30)
+    resp.raise_for_status()
+    init = _boomlify_payload(http, resp)
+    if not init.get("token"):
+        raise RuntimeError(f"no guest token in /guest/init response: {init}")
+    if init.get("guestFirstMailboxCaptchaEnabled"):
+        print("[!] Boomlify now asks guests for a captcha on the first mailbox; creation may fail")
+    http.headers["Authorization"] = f"Bearer {init['token']}"
+
+    resp = http.get(f"{BOOMLIFY_API_BASE}/domains/public", timeout=30)
+    resp.raise_for_status()
+    domains = [d for d in _boomlify_payload(http, resp)
+               if d.get("is_active", 1) and not d.get("is_premium")]
+    if BOOMLIFY_DOMAIN:
+        domains = [d for d in domains if d.get("domain") == BOOMLIFY_DOMAIN] or domains
+    if not domains:
+        raise RuntimeError("no public domains available")
+    domain = random.choice(domains)
+
+    local = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    resp = http.post(f"{BOOMLIFY_API_BASE}/emails/create",
+                     json={"email": f"{local}@{domain['domain']}", "domainId": domain["id"]},
+                     timeout=30)
+    if not resp.ok:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300].strip()}")
+    created = _boomlify_payload(http, resp)
+    return created.get("email"), created.get("id"), created.get("expires_at")
+
+
+def _create_boomlify_api_inbox(http):
     params = {"time": BOOMLIFY_EMAIL_TIME}
     if BOOMLIFY_DOMAIN:
         params["domain"] = BOOMLIFY_DOMAIN
+    resp = http.post(f"{BOOMLIFY_API_BASE}/api/v1/emails/create", params=params, timeout=30)
+    if not resp.ok:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300].strip()}")
+    body = _boomlify_payload(http, resp)
+    email = (body.get("data") or body).get("email") or {}
+    return email.get("address"), email.get("id"), email.get("expires_at")
+
+
+def create_boomlify_inbox():
+    """Create a Boomlify address; returns (address, email_id, http) or (None, None, None)."""
+    mode = "api" if BOOMLIFY_API_KEY else "guest"
+    http = _boomlify_session()
     try:
-        resp = _boomlify_session().post(f"{BOOMLIFY_API_BASE}/api/v1/emails/create",
-                                        params=params, timeout=30)
-        if not resp.ok:
-            print(f"[!] Boomlify create failed (HTTP {resp.status_code}): {resp.text[:300].strip()}")
-            return None, None
-        email = _boomlify_payload(resp).get("email") or {}
-        address, email_id = email.get("address"), email.get("id")
+        create = _create_boomlify_api_inbox if mode == "api" else _create_boomlify_guest_inbox
+        address, email_id, expires_at = create(http)
         if not address or not email_id:
-            print(f"[!] Boomlify: no address/id in create response: {resp.text[:300]!r}")
-            return None, None
-        print(f"[OK] Boomlify inbox: {address} (id={email_id}, expires {email.get('expires_at')})")
-        return address, email_id
+            print(f"[!] Boomlify ({mode}): no address/id in create response")
+            return None, None, None
+        print(f"[OK] Boomlify inbox ({mode}): {address} (id={email_id}, expires {expires_at})")
+        return address, email_id, http
     except Exception as exc:
-        print(f"[!] Failed to create Boomlify inbox: {exc}")
-        return None, None
+        print(f"[!] Failed to create Boomlify inbox ({mode}): {exc}")
+        return None, None, None
 
 
 def _boomlify_normalize_message(item):
@@ -1184,26 +1258,35 @@ def _boomlify_normalize_message(item):
     return {
         "id": item.get("id"),
         "subject": item.get("subject") or "",
-        "from": {"address": item.get("from_email") or ""},
+        "from": {"address": item.get("from_email") or item.get("from") or ""},
         "text": item.get("body_text") or _html_to_text(body_html),
         "html": [body_html] if body_html else [],
     }
 
 
-def get_boomlify_messages(email_id):
+def get_boomlify_messages(http, email_id):
     """Fetch the inbox once; returns normalized messages (bodies included)."""
     try:
-        resp = _boomlify_session().get(f"{BOOMLIFY_API_BASE}/api/v1/emails/{email_id}/messages",
-                                       params={"limit": 50}, timeout=30)
+        if BOOMLIFY_API_KEY:
+            resp = http.get(f"{BOOMLIFY_API_BASE}/api/v1/emails/{email_id}/messages",
+                            params={"limit": 50}, timeout=30)
+        else:
+            resp = http.get(f"{BOOMLIFY_API_BASE}/emails/{email_id}/received",
+                            params={"page": 1, "limit": 50, "skipCache": "true"}, timeout=30)
         resp.raise_for_status()
-        items = _boomlify_payload(resp).get("messages") or []
+        body = _boomlify_payload(http, resp)
     except Exception as exc:
         print(f"[!] Failed to fetch Boomlify inbox: {exc}")
         return []
-    return [_boomlify_normalize_message(item) for item in items if isinstance(item, dict)]
+    if isinstance(body, dict):
+        data = body.get("data", body)
+        items = data.get("messages") if isinstance(data, dict) else data
+    else:
+        items = body
+    return [_boomlify_normalize_message(item) for item in (items or []) if isinstance(item, dict)]
 
 
-def _wait_for_credentials_email_boomlify(email_id, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
+def _wait_for_credentials_email_boomlify(http, email_id, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
     """Poll the Boomlify inbox until the credentials email arrives."""
     print(f"[*] Waiting for credentials email (max {max_wait_seconds}s / {max_wait_seconds//60} minutes)...")
     deadline = time.time() + max_wait_seconds
@@ -1212,7 +1295,7 @@ def _wait_for_credentials_email_boomlify(email_id, max_wait_seconds=EMAIL_MAX_WA
         attempt += 1
         remaining = int(deadline - time.time())
         print(f"[*] Checking Boomlify inbox (attempt {attempt}, {remaining}s remaining)...")
-        messages = get_boomlify_messages(email_id)
+        messages = get_boomlify_messages(http, email_id)
         # Boomlify returns full bodies in the listing, so no per-message fetch.
         result = _scan_messages_for_credentials(messages, fetch_full=lambda msg: msg)
         if result:
@@ -1285,10 +1368,10 @@ def _create_session_for(backend):
         return {"backend": "mailcx", "address": address}
 
     if backend == "boomlify":
-        address, email_id = create_boomlify_inbox()
+        address, email_id, http = create_boomlify_inbox()
         if not address:
             return None
-        return {"backend": "boomlify", "address": address, "email_id": email_id}
+        return {"backend": "boomlify", "address": address, "email_id": email_id, "http": http}
 
     # Default: tmaily.com disposable inbox.
     address = create_tmaily_inbox()
@@ -1323,7 +1406,7 @@ def wait_for_credentials_email(driver, session, max_wait_seconds=EMAIL_MAX_WAIT_
     if backend == "mailcx":
         return _wait_for_credentials_email_mailcx(session["address"], max_wait_seconds)
     if backend == "boomlify":
-        return _wait_for_credentials_email_boomlify(session["email_id"], max_wait_seconds)
+        return _wait_for_credentials_email_boomlify(session["http"], session["email_id"], max_wait_seconds)
     return _wait_for_credentials_email_tmaily(session["address"], max_wait_seconds)
 
 
