@@ -95,6 +95,20 @@
             "enum": ["10min", "1hour", "1day", "permanent"],
             "enumTitles": ["10 minutes", "1 hour", "1 day (default)", "Permanent"]
         },
+        "boomlifyDomains": {
+            "title": "Boomlify preferred domains",
+            "type": "string",
+            "description": "Comma-separated Boomlify domains to use first, in order. IPTVV rejects some Boomlify domains as disposable; beta.pendulum.cyou is known to pass. If none is available, a random non-blocked domain is used.",
+            "editor": "textfield",
+            "default": "beta.pendulum.cyou"
+        },
+        "boomlifyBlockedDomains": {
+            "title": "Boomlify blocked domains",
+            "type": "string",
+            "description": "Comma-separated Boomlify domains IPTVV rejects as disposable; never used. Domains rejected during a run are skipped automatically for the rest of that run.",
+            "editor": "textfield",
+            "default": "kuromee.store"
+        },
         "tmailyDomain": {
             "title": "tmaily domain",
             "type": "string",

@@ -97,7 +97,23 @@ MAILCX_API_TOKEN = os.getenv("MAILCX_API_TOKEN", "").strip()
 BOOMLIFY_API_BASE = os.getenv("BOOMLIFY_API_BASE", "https://v1.boomlify.com").rstrip("/")
 BOOMLIFY_API_KEY = os.getenv("BOOMLIFY_API_KEY", "").strip()
 BOOMLIFY_EMAIL_TIME = os.getenv("BOOMLIFY_EMAIL_TIME", "1day").strip()  # 10min|1hour|1day|permanent
+# Guest-mode domains to use first, in order (IPTVV rejects some Boomlify domains
+# as disposable; beta.pendulum.cyou is known to pass). BOOMLIFY_DOMAIN is the
+# legacy single-domain name and also the API-mode domain.
 BOOMLIFY_DOMAIN = os.getenv("BOOMLIFY_DOMAIN", "").strip()
+BOOMLIFY_DOMAINS = [
+    d.strip().lower()
+    for d in (os.getenv("BOOMLIFY_DOMAINS") or BOOMLIFY_DOMAIN or "beta.pendulum.cyou").split(",")
+    if d.strip()
+]
+# Domains IPTVV's checkout is known to reject as temporary/disposable.
+BOOMLIFY_BLOCKED_DOMAINS = {
+    d.strip().lower()
+    for d in os.getenv("BOOMLIFY_BLOCKED_DOMAINS", "kuromee.store").split(",")
+    if d.strip()
+}
+# How many fresh addresses to try when checkout rejects one as disposable.
+IPTVV_EMAIL_REJECT_RETRIES = int(os.getenv("IPTVV_EMAIL_REJECT_RETRIES", "4"))
 # Domain to mint mailcx addresses on; leave "" to use whatever /v1/config marks default.
 MAILCX_DOMAIN = os.getenv("MAILCX_DOMAIN", "").strip()
 IPTVV_GMAIL_ADDRESS = os.getenv("IPTVV_GMAIL_ADDRESS", "wdmonitoring@gmail.com").strip()
@@ -151,6 +167,10 @@ class CloudflareBlockedError(RuntimeError):
 
 class TrialRejectedError(RuntimeError):
     """Raised when IPTVV accepts checkout but refuses to issue trial credentials."""
+
+
+class DisposableEmailRejectedError(TrialRejectedError):
+    """Raised when checkout rejects the email address as temporary/disposable."""
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1118,6 +1138,8 @@ BOOMLIFY_WEB_BASE = "https://boomlify.com"
 # Fallback XOR key if the bundle can't be fetched/parsed.
 _BOOMLIFY_DEFAULT_KEY = "7a9b3c8d2e1f4g5h6i9j0k8l2m4n6o8p"
 _boomlify_keys_cache = None
+# Domains IPTVV rejected during this run; never offered again.
+_boomlify_rejected_domains = set()
 
 
 def _html_to_text(fragment):
@@ -1206,13 +1228,20 @@ def _create_boomlify_guest_inbox(http):
 
     resp = http.get(f"{BOOMLIFY_API_BASE}/domains/public", timeout=30)
     resp.raise_for_status()
+    skip = BOOMLIFY_BLOCKED_DOMAINS | _boomlify_rejected_domains
     domains = [d for d in _boomlify_payload(http, resp)
-               if d.get("is_active", 1) and not d.get("is_premium")]
-    if BOOMLIFY_DOMAIN:
-        domains = [d for d in domains if d.get("domain") == BOOMLIFY_DOMAIN] or domains
+               if d.get("is_active", 1) and not d.get("is_premium")
+               and (d.get("domain") or "").lower() not in skip]
     if not domains:
-        raise RuntimeError("no public domains available")
-    domain = random.choice(domains)
+        raise RuntimeError(f"no usable public domains (skipped: {', '.join(sorted(skip))})")
+    by_name = {d["domain"].lower(): d for d in domains}
+    preferred = [by_name[name] for name in BOOMLIFY_DOMAINS if name in by_name]
+    if preferred:
+        domain = preferred[0]
+    else:
+        # The domain that passed IPTVV's filter is a subdomain, so try those first.
+        subdomains = [d for d in domains if d["domain"].count(".") >= 2]
+        domain = random.choice(subdomains or domains)
 
     local = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
     resp = http.post(f"{BOOMLIFY_API_BASE}/emails/create",
@@ -2726,7 +2755,7 @@ def submit_checkout_form(driver):
             except Exception:
                 checkout_text = ""
             if "disposable email" in checkout_text or "temporary or disposable" in checkout_text:
-                raise TrialRejectedError(
+                raise DisposableEmailRejectedError(
                     "IPTVV rejected the email address as temporary/disposable; "
                     "use the 'gmail' backend (a permanent address)."
                 )
@@ -3185,17 +3214,31 @@ def run_automation():
         # Step 3: Select full channel package.
         select_full_channel_package(driver)
 
-        # Step 4: Allocate a receiving address only after the checkout form is reachable.
-        email_session = create_email_session(email_backends)
-        if not email_session:
-            raise RuntimeError(f"Failed to create temporary email (tried {', '.join(email_backends)})")
-        email_address = email_session["address"]
+        # Steps 4-6: allocate an address, fill and submit checkout. If IPTVV
+        # rejects the address as disposable, retry on the same checkout page
+        # with a fresh address on another domain (or the next backend).
+        for email_attempt in range(1, IPTVV_EMAIL_REJECT_RETRIES + 1):
+            # Step 4: Allocate a receiving address only after the checkout form is reachable.
+            email_session = create_email_session(email_backends)
+            if not email_session:
+                raise RuntimeError(f"Failed to create temporary email (tried {', '.join(email_backends)})")
+            email_address = email_session["address"]
 
-        # Step 5: Fill checkout form with the temporary email
-        fill_checkout_form(driver, email_address)
+            # Step 5: Fill checkout form with the temporary email
+            fill_checkout_form(driver, email_address)
 
-        # Step 6: Submit form
-        submit_checkout_form(driver)
+            # Step 6: Submit form
+            try:
+                submit_checkout_form(driver)
+                break
+            except DisposableEmailRejectedError:
+                domain = email_address.rsplit("@", 1)[-1].lower()
+                _boomlify_rejected_domains.add(domain)
+                print(f"[!] {domain} rejected as disposable (attempt {email_attempt}/"
+                      f"{IPTVV_EMAIL_REJECT_RETRIES}); add it to BOOMLIFY_BLOCKED_DOMAINS")
+                if email_attempt == IPTVV_EMAIL_REJECT_RETRIES:
+                    raise
+                print("[*] Retrying checkout with another address...")
 
         # Step 7: Wait for credentials email (this can take 5-45 minutes)
         print("\n" + "=" * 60)
