@@ -31,6 +31,11 @@ _ENV_MAP = {
     "iboPlayerDeviceKey": "IPTVV_IBOPLAYER_DEVICE_KEY",
     "iboPlayerPlaylistUrlId": "IPTVV_IBOPLAYER_PLAYLIST_URL_ID",
     "iboPlayerPlaylistName": "IPTVV_IBOPLAYER_PLAYLIST_NAME",
+    "githubToken": "IPTVV_GITHUB_TOKEN",
+    "githubRepo": "IPTVV_GITHUB_REPO",
+    "githubSecretName": "IPTVV_GITHUB_SECRET_NAME",
+    "githubWorkflow": "IPTVV_GITHUB_WORKFLOW",
+    "githubRef": "IPTVV_GITHUB_REF",
 }
 
 
@@ -43,6 +48,9 @@ def _apply_input_to_env(actor_input):
 
     if actor_input.get("iboPlayerEnabled"):
         os.environ["IPTVV_IBOPLAYER_ENABLED"] = "True"
+
+    if actor_input.get("githubEnabled"):
+        os.environ["IPTVV_GITHUB_ENABLED"] = "True"
 
     # Apify runs Chrome headed under an Xvfb virtual display (see the actor's
     # `xvfb-run ...` launch command). Headed mode loads the proxy-auth extension

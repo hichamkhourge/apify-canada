@@ -18,3 +18,5 @@ setuptools >= 70.0
 # SVG rasterization for the IBO Player device-login captcha (needs libcairo2,
 # installed via the Dockerfile). Pulls in Pillow + cairocffi.
 cairosvg ~= 2.7
+# Seals the M3U URL for the GitHub Actions secret (playlist-updater integration).
+pynacl ~= 1.5

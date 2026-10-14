@@ -123,6 +123,15 @@ IPTVV_IBOPLAYER_PLAYLIST_URL_ID = os.getenv("IPTVV_IBOPLAYER_PLAYLIST_URL_ID", "
 IPTVV_IBOPLAYER_PLAYLIST_NAME = os.getenv("IPTVV_IBOPLAYER_PLAYLIST_NAME", "IPTVV Canada")
 IPTVV_IBOPLAYER_PLAYLIST_URL_TEMPLATE = os.getenv("IPTVV_IBOPLAYER_PLAYLIST_URL", "http://iptvvcanada.com")
 
+# GitHub playlist-updater integration: stores the M3U URL in a repo Actions
+# secret and dispatches the workflow that republishes the playlist.
+IPTVV_GITHUB_ENABLED = os.getenv("IPTVV_GITHUB_ENABLED", "False").lower() == "true"
+IPTVV_GITHUB_TOKEN = (os.getenv("IPTVV_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN", "")).strip()
+IPTVV_GITHUB_REPO = os.getenv("IPTVV_GITHUB_REPO", "hichamkhourge/playlist-updater").strip()
+IPTVV_GITHUB_SECRET_NAME = os.getenv("IPTVV_GITHUB_SECRET_NAME", "M3U_SOURCE_URL").strip()
+IPTVV_GITHUB_WORKFLOW = os.getenv("IPTVV_GITHUB_WORKFLOW", "update-gist.yml").strip()
+IPTVV_GITHUB_REF = os.getenv("IPTVV_GITHUB_REF", "main").strip()
+
 # Email subject patterns to detect credentials email (checked case-insensitively)
 CREDENTIALS_EMAIL_SUBJECTS = [
     "Free 24-Hour IPTV Trial Subscription",  # Current IPTVV format
@@ -2947,6 +2956,88 @@ def save_to_iboplayer(username, password, hostname, max_retries=3):
     return False
 
 
+def update_github_playlist(m3u_url, max_retries=3):
+    """
+    Store the M3U URL in the playlist-updater repo's Actions secret and
+    dispatch the workflow that rebuilds the playlist from it.
+
+    Args:
+        m3u_url: Full get.php M3U URL for the new trial
+        max_retries: Maximum attempts per request on 5xx/timeouts (default: 3)
+
+    Returns:
+        bool: True if the secret was updated and the workflow dispatched
+    """
+    if not IPTVV_GITHUB_ENABLED:
+        print("[*] GitHub playlist update is disabled (IPTVV_GITHUB_ENABLED=False)")
+        return False
+
+    if not IPTVV_GITHUB_TOKEN:
+        print("[!] GitHub playlist update enabled but IPTVV_GITHUB_TOKEN is missing")
+        return False
+
+    try:
+        from nacl import encoding, public
+    except ImportError:
+        print("[!] PyNaCl is not installed - cannot encrypt the GitHub secret")
+        return False
+
+    api = f"https://api.github.com/repos/{IPTVV_GITHUB_REPO}"
+    headers = {
+        "Authorization": f"Bearer {IPTVV_GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    def request(method, url, **kwargs):
+        """Send one GitHub API call, retrying 5xx/timeouts. Returns the response or None."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.request(method, url, headers=headers, timeout=30, **kwargs)
+                if response.status_code < 400:
+                    return response
+                if response.status_code < 500:
+                    # Client error - don't retry, token/repo configuration issue
+                    print(f"[!] GitHub API error {response.status_code} on {method} {url}: {response.text[:200]}")
+                    print("[!] Check the token has Secrets + Actions write access to the repo")
+                    return None
+                print(f"[!] GitHub API error {response.status_code} (attempt {attempt}/{max_retries})")
+            except requests.RequestException as e:
+                print(f"[!] GitHub API request failed (attempt {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)
+        return None
+
+    print("\n" + "=" * 60)
+    print(f"[*] Updating GitHub secret {IPTVV_GITHUB_SECRET_NAME} in {IPTVV_GITHUB_REPO}...")
+    print("=" * 60)
+
+    try:
+        # 1) The secret must be sealed with the repo's Actions public key
+        key_resp = request("GET", f"{api}/actions/secrets/public-key")
+        if key_resp is None:
+            return False
+        key = key_resp.json()
+        pk = public.PublicKey(key["key"].encode(), encoding.Base64Encoder())
+        encrypted = base64.b64encode(public.SealedBox(pk).encrypt(m3u_url.encode())).decode()
+
+        if request("PUT", f"{api}/actions/secrets/{IPTVV_GITHUB_SECRET_NAME}",
+                   json={"encrypted_value": encrypted, "key_id": key["key_id"]}) is None:
+            return False
+        print(f"[OK] Secret {IPTVV_GITHUB_SECRET_NAME} updated")
+
+        # 2) Trigger the workflow so the playlist picks up the new source now
+        if request("POST", f"{api}/actions/workflows/{IPTVV_GITHUB_WORKFLOW}/dispatches",
+                   json={"ref": IPTVV_GITHUB_REF}) is None:
+            return False
+        print(f"[OK] Workflow {IPTVV_GITHUB_WORKFLOW} dispatched on {IPTVV_GITHUB_REF}")
+        return True
+
+    except Exception as e:
+        print(f"[!] GitHub playlist update failed: {e}")
+        return False
+
+
 # ═══════════════════════════════════════════════════════════
 # Webhook & Notification Integration
 # ═══════════════════════════════════════════════════════════
@@ -3071,7 +3162,7 @@ def run_automation():
             raise RuntimeError("Failed to extract complete credentials from email")
 
         # Construct M3U URL
-        m3u_url = f"{hostname}/get.php?username={username}&password={password}&type=m3u_plus&output=ts"
+        m3u_url = f"{hostname.rstrip('/')}/get.php?username={username}&password={password}&type=m3u_plus&output=ts"
 
         # Success!
         print("\n" + "=" * 60)
@@ -3086,12 +3177,16 @@ def run_automation():
         # Save to IBO Player if enabled
         save_to_iboplayer(username, password, hostname)
 
+        # Push the M3U URL to the GitHub playlist-updater if enabled
+        github_updated = update_github_playlist(m3u_url)
+
         return {
             "email": email_address,
             "username": username,
             "password": password,
             "host": hostname,
             "m3u_url": m3u_url,
+            "github_updated": github_updated,
         }
 
     finally:

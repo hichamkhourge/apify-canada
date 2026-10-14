@@ -64,7 +64,7 @@
             "type": "string",
             "description": "Comma-separated backends tried in order when the primary one fails (e.g. mail.cx 402 over quota, bad Gmail app password, inbox allocation error). Allowed: mailcx, emailondeck, tmaily, gmail, procmail, mailtm.",
             "editor": "textfield",
-            "default": "tmaily,procmail,mailtm"
+            "default": "gmail"
         },
         "mailcxApiToken": {
             "title": "mail.cx API token",
@@ -167,6 +167,48 @@
             "description": "Display name for the saved playlist.",
             "editor": "textfield",
             "default": "IPTVV Canada"
+        },
+        "githubEnabled": {
+            "title": "Update GitHub playlist",
+            "type": "boolean",
+            "description": "If enabled, the M3U URL is stored in a GitHub Actions secret and the playlist-updater workflow is triggered.",
+            "editor": "checkbox",
+            "default": false
+        },
+        "githubToken": {
+            "title": "GitHub token",
+            "type": "string",
+            "description": "GitHub token with Secrets (write) and Actions (write) access to the playlist repo. Required when GitHub update is enabled.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "githubRepo": {
+            "title": "GitHub repository",
+            "type": "string",
+            "description": "owner/name of the playlist-updater repository.",
+            "editor": "textfield",
+            "default": "hichamkhourge/playlist-updater"
+        },
+        "githubSecretName": {
+            "title": "GitHub secret name",
+            "type": "string",
+            "description": "Actions secret that receives the M3U URL.",
+            "editor": "textfield",
+            "default": "M3U_SOURCE_URL"
+        },
+        "githubWorkflow": {
+            "title": "GitHub workflow file",
+            "type": "string",
+            "description": "Workflow file (or ID) dispatched after the secret is updated.",
+            "editor": "textfield",
+            "default": "update-gist.yml"
+        },
+        "githubRef": {
+            "title": "GitHub workflow ref",
+            "type": "string",
+            "description": "Branch the workflow is dispatched on.",
+            "editor": "textfield",
+            "default": "main"
         }
     },
     "required": []
