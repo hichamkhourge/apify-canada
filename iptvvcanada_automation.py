@@ -64,8 +64,9 @@ EMAIL_MAX_WAIT_SECONDS = int(os.getenv("IPTVV_EMAIL_MAX_WAIT_SECONDS", "2700")) 
 #                (MAILCX_API_TOKEN, from the mail.cx dashboard -> Tokens).
 #                GET /v1/inbox/<address> long-polls server-side for up to 25s
 #                per call, so no client-side poll loop is needed.
-#   "emailondeck"     — emailondeck.com. Address creation is behind an hCaptcha, solved
-#                with 2captcha (needs TWOCAPTCHA_API_KEY); the inbox is then plain HTTP.
+#   "boomlify"        — v1.boomlify.com REST API (needs BOOMLIFY_API_KEY). Creating
+#                an address costs credits; reading messages is free. Lifetime is
+#                BOOMLIFY_EMAIL_TIME (default 1day, so it outlives the email wait).
 #   "tmaily"          — tmaily.com same-origin REST API. GET /generate for an
 #                address (session cookie binds the inbox), GET /emails?address=
 #                for messages. Inboxes auto-expire after 24h. Addresses are
@@ -93,7 +94,10 @@ TMAILY_DOMAIN = os.getenv("TMAILY_DOMAIN", "imgcompress.io").strip()
 PROCMAIL_API_BASE = os.getenv("PROCMAIL_API_BASE", "https://api.procmail.xyz").rstrip("/")
 MAILCX_API_BASE = os.getenv("MAILCX_API_BASE", "https://api.mail.cx/v1").rstrip("/")
 MAILCX_API_TOKEN = os.getenv("MAILCX_API_TOKEN", "").strip()
-EMAILONDECK_BASE = os.getenv("EMAILONDECK_BASE", "https://www.emailondeck.com").rstrip("/")
+BOOMLIFY_API_BASE = os.getenv("BOOMLIFY_API_BASE", "https://v1.boomlify.com").rstrip("/")
+BOOMLIFY_API_KEY = os.getenv("BOOMLIFY_API_KEY", "").strip()
+BOOMLIFY_EMAIL_TIME = os.getenv("BOOMLIFY_EMAIL_TIME", "1day").strip()  # 10min|1hour|1day|permanent
+BOOMLIFY_DOMAIN = os.getenv("BOOMLIFY_DOMAIN", "").strip()
 # Domain to mint mailcx addresses on; leave "" to use whatever /v1/config marks default.
 MAILCX_DOMAIN = os.getenv("MAILCX_DOMAIN", "").strip()
 IPTVV_GMAIL_ADDRESS = os.getenv("IPTVV_GMAIL_ADDRESS", "wdmonitoring@gmail.com").strip()
@@ -1095,32 +1099,31 @@ def _wait_for_credentials_email_gmail(alias, max_wait_seconds=EMAIL_MAX_WAIT_SEC
 
 
 # ═══════════════════════════════════════════════════════════
-# EmailOnDeck backend — emailondeck.com, pure HTTP + 2captcha hCaptcha
+# Boomlify backend — v1.boomlify.com REST API (X-API-Key auth, no captcha)
 #
-#   GET  /                    -> homepage carrying an hCaptcha (data-sitekey)
-#   POST /?act=recap          -> with h-captcha-response; 302s to /eod.php, which
-#                                embeds the new address (`var email='...'`). The
-#                                PHPSESSID cookie binds the inbox, so one
-#                                requests.Session == one inbox.
-#   POST /ajax/messages.php   -> "<count>|<|>|<rows html>"; each row is a
-#                                `.msglink` element whose name= is the message id.
-#   GET  /email_iframe.php?msg_id=N -> the message body (email.php only wraps it in an iframe).
-# There is no free API, and creating an address costs one 2captcha solve.
+#   POST /api/v1/emails/create?time=1day -> {"email": {"id", "address", ...}}
+#   GET  /api/v1/emails/{id}/messages    -> {"messages": [{"id", "subject",
+#                                           "from_email", "body_text", "body_html", ...}]}
+#   GET  /api/v1/account/credits         -> cheap authenticated key check
+# Creating an address costs credits; reading messages is free. Responses
+# proxied through ApyHub nest the payload under "data", so both shapes parse.
 # ═══════════════════════════════════════════════════════════
-def solve_hcaptcha_token(sitekey, page_url, attempts=2):
-    """Solve an hCaptcha through 2captcha; returns the token or None."""
-    if not TWOCAPTCHA_API_KEY:
-        print("[!] TWOCAPTCHA_API_KEY is not set, cannot solve hCaptcha")
-        return None
-    hsolver = TwoCaptcha(TWOCAPTCHA_API_KEY, defaultTimeout=150, pollingInterval=5)
-    for attempt in range(1, attempts + 1):
-        try:
-            print(f"[*] Solving hCaptcha via 2captcha (attempt {attempt}/{attempts}, "
-                  f"sitekey={sitekey}, url={page_url})...")
-            return hsolver.hcaptcha(sitekey=sitekey, url=page_url)["code"]
-        except Exception as exc:
-            print(f"[!] hCaptcha solve failed: {exc}")
-    return None
+def _boomlify_session():
+    http = requests.Session()
+    http.headers.update({
+        "X-API-Key": BOOMLIFY_API_KEY,
+        "Accept": "application/json",
+        "User-Agent": get_random_user_agent(),
+    })
+    return http
+
+
+def _boomlify_payload(resp):
+    """Return the response body, unwrapping an ApyHub-style "data" envelope."""
+    body = resp.json()
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        return body["data"]
+    return body
 
 
 def _html_to_text(fragment):
@@ -1129,129 +1132,95 @@ def _html_to_text(fragment):
     return re.sub(r"\s+", " ", html.unescape(fragment)).strip()
 
 
-def create_emailondeck_inbox():
-    """Solve the hCaptcha and mint an address; returns (address, requests.Session) or (None, None)."""
-    base = EMAILONDECK_BASE
-    http = requests.Session()
-    http.headers["User-Agent"] = get_random_user_agent()
-    if IPTVV_PROXY_URL:
-        http.proxies = {"http": IPTVV_PROXY_URL, "https": IPTVV_PROXY_URL}
-        http.verify = False
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+def verify_boomlify_key():
+    """Check BOOMLIFY_API_KEY before spending a browser session on it.
+
+    Returns False if Boomlify rejects the account (401/402/403/429, e.g. bad
+    key, out of credits or daily limit hit) so the caller can fall back to
+    another backend. Raises on a missing key or network failure.
+    """
+    if not BOOMLIFY_API_KEY:
+        raise RuntimeError("BOOMLIFY_API_KEY is not set; the boomlify backend needs an API key "
+                           "from the Boomlify dashboard")
     try:
-        page = http.get(f"{base}/", timeout=30)
-        page.raise_for_status()
-        match = re.search(r'data-sitekey="([^"]+)"', page.text)
-        if not match:
-            print("[!] emailondeck: no hCaptcha sitekey on the homepage")
-            return None, None
-        token = solve_hcaptcha_token(match.group(1), f"{base}/")
-        if not token:
-            return None, None
-        resp = http.post(
-            f"{base}/?act=recap",
-            data={"h-captcha-response": token, "g-recaptcha-response": token},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        found = re.search(r"var email='([^']+)'", resp.text)
-        if not found:
-            print(f"[!] emailondeck: no address in response from {resp.url}")
-            return None, None
-        address = found.group(1)
-        print(f"[OK] emailondeck inbox: {address}")
-        return address, http
+        resp = _boomlify_session().get(f"{BOOMLIFY_API_BASE}/api/v1/account/credits", timeout=15)
     except Exception as exc:
-        print(f"[!] Failed to create emailondeck inbox: {exc}")
+        raise RuntimeError(f"Boomlify API key check failed: {exc}") from exc
+    if resp.status_code in (401, 402, 403, 429):
+        print(f"[!] Boomlify rejected the API key (HTTP {resp.status_code}): "
+              f"{resp.text[:200].strip()}")
+        return False
+    if not resp.ok:
+        raise RuntimeError(f"Boomlify API key check returned HTTP {resp.status_code}: "
+                           f"{resp.text[:200].strip()}")
+    return True
+
+
+def create_boomlify_inbox():
+    """Create a Boomlify address; returns (address, email_id) or (None, None)."""
+    params = {"time": BOOMLIFY_EMAIL_TIME}
+    if BOOMLIFY_DOMAIN:
+        params["domain"] = BOOMLIFY_DOMAIN
+    try:
+        resp = _boomlify_session().post(f"{BOOMLIFY_API_BASE}/api/v1/emails/create",
+                                        params=params, timeout=30)
+        if not resp.ok:
+            print(f"[!] Boomlify create failed (HTTP {resp.status_code}): {resp.text[:300].strip()}")
+            return None, None
+        email = _boomlify_payload(resp).get("email") or {}
+        address, email_id = email.get("address"), email.get("id")
+        if not address or not email_id:
+            print(f"[!] Boomlify: no address/id in create response: {resp.text[:300]!r}")
+            return None, None
+        print(f"[OK] Boomlify inbox: {address} (id={email_id}, expires {email.get('expires_at')})")
+        return address, email_id
+    except Exception as exc:
+        print(f"[!] Failed to create Boomlify inbox: {exc}")
         return None, None
 
 
-def get_emailondeck_messages(http):
-    """Fetch the inbox once; returns normalized message summaries."""
+def _boomlify_normalize_message(item):
+    body_html = item.get("body_html") or ""
+    return {
+        "id": item.get("id"),
+        "subject": item.get("subject") or "",
+        "from": {"address": item.get("from_email") or ""},
+        "text": item.get("body_text") or _html_to_text(body_html),
+        "html": [body_html] if body_html else [],
+    }
+
+
+def get_boomlify_messages(email_id):
+    """Fetch the inbox once; returns normalized messages (bodies included)."""
     try:
-        resp = http.post(
-            f"{EMAILONDECK_BASE}/ajax/messages.php",
-            headers={"X-Requested-With": "XMLHttpRequest"},
-            timeout=30,
-        )
+        resp = _boomlify_session().get(f"{BOOMLIFY_API_BASE}/api/v1/emails/{email_id}/messages",
+                                       params={"limit": 50}, timeout=30)
         resp.raise_for_status()
-        parts = resp.text.split("|<|>|", 1)
-        rows_html = parts[1] if len(parts) > 1 else ""
-        if len(parts) < 2:
-            print(f"[!] emailondeck: unexpected inbox response (HTTP {resp.status_code}, "
-                  f"{len(resp.text)} bytes): {resp.text[:300]!r}")
+        items = _boomlify_payload(resp).get("messages") or []
     except Exception as exc:
-        print(f"[!] Failed to fetch emailondeck inbox: {exc}")
+        print(f"[!] Failed to fetch Boomlify inbox: {exc}")
         return []
-    count_prefix = parts[0].strip() if len(parts) > 1 else ""
-    messages = []
-    for tag in re.finditer(
-        r"""(?is)<(\w+)\b[^>]*class=["'][^"']*msglink[^"']*["'][^>]*>(.*?)</\1>""", rows_html
-    ):
-        name = re.search(r"""name=["']?(\w+)""", tag.group(0))
-        if not name:
-            continue
-        cells = [c.strip() for c in re.findall(r">([^<>]+)<", f">{tag.group(2)}<") if c.strip()]
-        whole = _html_to_text(tag.group(2))
-        sender, subject = (cells[0], cells[1]) if len(cells) >= 2 else (whole, whole)
-        messages.append({
-            "id": name.group(1),
-            "subject": html.unescape(subject),
-            "from": {"address": html.unescape(sender)},
-            "text": "",
-            "html": [],
-        })
-    if not messages and rows_html.strip():
-        # Server returned rows but the msglink regex found none: the markup changed.
-        print(f"[!] emailondeck: count={count_prefix!r} but no rows parsed; raw rows: {rows_html[:600]!r}")
-    return messages
+    return [_boomlify_normalize_message(item) for item in items if isinstance(item, dict)]
 
 
-def _emailondeck_fetch_full(http):
-    def fetch(msg):
-        if msg.get("text") or msg.get("html"):
-            return msg
-        try:
-            # email.php is just site chrome; the message body lives in its iframe.
-            resp = http.get(f"{EMAILONDECK_BASE}/email_iframe.php", params={"msg_id": msg["id"]}, timeout=30)
-            resp.raise_for_status()
-            full = dict(msg)
-            full["text"] = _html_to_text(resp.text)
-            full["html"] = [resp.text]
-            return full
-        except Exception as exc:
-            print(f"[!] Failed to fetch emailondeck message {msg.get('id')}: {exc}")
-            return msg
-    return fetch
-
-
-def _wait_for_credentials_email_emailondeck(http, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
-    """Poll the emailondeck inbox until the credentials email arrives."""
+def _wait_for_credentials_email_boomlify(email_id, max_wait_seconds=EMAIL_MAX_WAIT_SECONDS):
+    """Poll the Boomlify inbox until the credentials email arrives."""
     print(f"[*] Waiting for credentials email (max {max_wait_seconds}s / {max_wait_seconds//60} minutes)...")
     deadline = time.time() + max_wait_seconds
     attempt = 0
     while time.time() < deadline:
         attempt += 1
         remaining = int(deadline - time.time())
-        print(f"[*] Checking emailondeck inbox (attempt {attempt}, {remaining}s remaining)...")
-        messages = get_emailondeck_messages(http)
-        result = _scan_messages_for_credentials(messages, fetch_full=_emailondeck_fetch_full(http))
+        print(f"[*] Checking Boomlify inbox (attempt {attempt}, {remaining}s remaining)...")
+        messages = get_boomlify_messages(email_id)
+        # Boomlify returns full bodies in the listing, so no per-message fetch.
+        result = _scan_messages_for_credentials(messages, fetch_full=lambda msg: msg)
         if result:
             return result
         if messages:
             print(f"[*] Found {len(messages)} email(s), but credentials email not yet received")
         else:
             print("[*] Inbox is empty")
-            if attempt == 1 or attempt % 10 == 0:
-                # Periodic raw dump to tell "truly empty" from "session/proxy broke".
-                try:
-                    raw = http.post(f"{EMAILONDECK_BASE}/ajax/messages.php",
-                                    headers={"X-Requested-With": "XMLHttpRequest"}, timeout=30)
-                    print(f"[debug] emailondeck raw inbox: HTTP {raw.status_code}, "
-                          f"{len(raw.text)} bytes, cookies={list(http.cookies.keys())}: {raw.text[:300]!r}")
-                except Exception as exc:
-                    print(f"[debug] emailondeck raw inbox fetch failed: {exc}")
         time.sleep(min(EMAIL_POLL_SECONDS, max(0, deadline - time.time())))
 
     print(f"[!] Timeout: Credentials email not received after {max_wait_seconds}s")
@@ -1281,9 +1250,8 @@ def email_backend_ready(backend):
             verify_gmail_login()
         elif backend == "mailcx":
             return verify_mailcx_token()
-        elif backend == "emailondeck":
-            if not TWOCAPTCHA_API_KEY:
-                raise RuntimeError("TWOCAPTCHA_API_KEY is required for emailondeck")
+        elif backend == "boomlify":
+            return verify_boomlify_key()
     except Exception as exc:
         print(f"[!] {backend} backend pre-flight failed: {exc}")
         return False
@@ -1316,11 +1284,11 @@ def _create_session_for(backend):
             return None
         return {"backend": "mailcx", "address": address}
 
-    if backend == "emailondeck":
-        address, http = create_emailondeck_inbox()
+    if backend == "boomlify":
+        address, email_id = create_boomlify_inbox()
         if not address:
             return None
-        return {"backend": "emailondeck", "address": address, "http": http}
+        return {"backend": "boomlify", "address": address, "email_id": email_id}
 
     # Default: tmaily.com disposable inbox.
     address = create_tmaily_inbox()
@@ -1354,8 +1322,8 @@ def wait_for_credentials_email(driver, session, max_wait_seconds=EMAIL_MAX_WAIT_
         return _wait_for_credentials_email_gmail(session["address"], max_wait_seconds)
     if backend == "mailcx":
         return _wait_for_credentials_email_mailcx(session["address"], max_wait_seconds)
-    if backend == "emailondeck":
-        return _wait_for_credentials_email_emailondeck(session["http"], max_wait_seconds)
+    if backend == "boomlify":
+        return _wait_for_credentials_email_boomlify(session["email_id"], max_wait_seconds)
     return _wait_for_credentials_email_tmaily(session["address"], max_wait_seconds)
 
 

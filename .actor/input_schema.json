@@ -53,16 +53,16 @@
         "emailBackend": {
             "title": "Email backend",
             "type": "string",
-            "description": "Which mailbox to use for receiving the credentials email. 'mailcx' uses api.mail.cx (requires an API token below); 'emailondeck' uses emailondeck.com (hCaptcha solved via 2captcha, so a 2captcha key is required); 'tmaily' allocates a disposable tmaily.com inbox per run; 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
+            "description": "Which mailbox to use for receiving the credentials email. 'mailcx' uses api.mail.cx (requires an API token below); 'boomlify' uses the boomlify.com API (requires an API key below); 'tmaily' allocates a disposable tmaily.com inbox per run; 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
             "editor": "select",
             "default": "mailcx",
-            "enum": ["mailcx", "emailondeck", "tmaily", "gmail", "procmail", "mailtm"],
-            "enumTitles": ["mail.cx (default)", "emailondeck.com (needs 2captcha key)", "tmaily.com", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
+            "enum": ["mailcx", "boomlify", "tmaily", "gmail", "procmail", "mailtm"],
+            "enumTitles": ["mail.cx (default)", "boomlify.com (needs API key)", "tmaily.com", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
         },
         "emailFallbacks": {
             "title": "Email fallback backends",
             "type": "string",
-            "description": "Comma-separated backends tried in order when the primary one fails (e.g. mail.cx 402 over quota, bad Gmail app password, inbox allocation error). Allowed: mailcx, emailondeck, tmaily, gmail, procmail, mailtm.",
+            "description": "Comma-separated backends tried in order when the primary one fails (e.g. mail.cx 402 over quota, bad Gmail app password, inbox allocation error). Allowed: mailcx, boomlify, tmaily, gmail, procmail, mailtm.",
             "editor": "textfield",
             "default": "gmail"
         },
@@ -78,6 +78,22 @@
             "type": "string",
             "description": "Domain to mint mail.cx addresses on (must be one of mail.cx's system domains). Leave empty to use mail.cx's default domain.",
             "editor": "textfield"
+        },
+        "boomlifyApiKey": {
+            "title": "Boomlify API key",
+            "type": "string",
+            "description": "API key from the Boomlify dashboard. Required for the 'boomlify' backend; each inbox creation costs credits.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "boomlifyEmailTime": {
+            "title": "Boomlify inbox lifetime",
+            "type": "string",
+            "description": "How long the Boomlify address lives. Must outlast the email wait (up to 45 min), so 10min is too short.",
+            "editor": "select",
+            "default": "1day",
+            "enum": ["10min", "1hour", "1day", "permanent"],
+            "enumTitles": ["10 minutes", "1 hour", "1 day (default)", "Permanent"]
         },
         "tmailyDomain": {
             "title": "tmaily domain",

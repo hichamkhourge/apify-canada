@@ -18,6 +18,8 @@ _ENV_MAP = {
     "emailBackend": "IPTVV_EMAIL_BACKEND",
     "emailFallbacks": "IPTVV_EMAIL_FALLBACKS",
     "tmailyDomain": "TMAILY_DOMAIN",
+    "boomlifyApiKey": "BOOMLIFY_API_KEY",
+    "boomlifyEmailTime": "BOOMLIFY_EMAIL_TIME",
     "mailcxApiToken": "MAILCX_API_TOKEN",
     "mailcxDomain": "MAILCX_DOMAIN",
     "gmailAddress": "IPTVV_GMAIL_ADDRESS",
