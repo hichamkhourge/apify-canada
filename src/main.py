@@ -95,10 +95,31 @@ async def _apply_proxy_to_env(actor_input):
         Actor.log.warning(f"Failed to set up Apify proxy ({exc}); using direct connection")
 
 
+async def _push_m3u_only(m3u_url):
+    """Skip the trial flow and only push an existing M3U URL to GitHub."""
+    # Supplying an M3U URL is an explicit request for the GitHub step.
+    os.environ["IPTVV_GITHUB_ENABLED"] = "True"
+    import iptvvcanada_automation as bot
+
+    Actor.log.info("M3U URL provided; skipping trial automation and only updating GitHub")
+    updated = await asyncio.to_thread(bot.update_github_playlist, m3u_url)
+    output = {"status": "success" if updated else "failed", "m3u_url": m3u_url, "github_updated": updated}
+    await Actor.push_data(output)
+    await Actor.set_value("OUTPUT", output)
+    if not updated:
+        await Actor.fail(status_message="GitHub playlist update failed (see log)")
+
+
 async def main():
     async with Actor:
         actor_input = await Actor.get_input() or {}
         _apply_input_to_env(actor_input)
+
+        m3u_url = (actor_input.get("m3uUrl") or "").strip()
+        if m3u_url:
+            await _push_m3u_only(m3u_url)
+            return
+
         await _apply_proxy_to_env(actor_input)
 
         user_id = actor_input.get("userId")
