@@ -35,6 +35,7 @@ from twocaptcha import TwoCaptcha
 from webdriver_manager.chrome import ChromeDriverManager
 
 import iboplayer_auth
+import player_api
 
 load_dotenv()
 
@@ -3271,6 +3272,12 @@ def run_automation():
         # Save to IBO Player if enabled
         save_to_iboplayer(username, password, hostname)
 
+        # Update the playlist on the IPTV player if configured
+        player_updated = (
+            player_api.update_player_playlist(hostname, username, password)
+            if player_api.player_enabled() else False
+        )
+
         # Push the M3U URL to the GitHub playlist-updater if enabled
         github_updated = update_github_playlist(m3u_url)
 
@@ -3281,6 +3288,7 @@ def run_automation():
             "host": hostname,
             "m3u_url": m3u_url,
             "github_updated": github_updated,
+            "player_updated": player_updated,
         }
 
     finally:

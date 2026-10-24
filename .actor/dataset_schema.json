@@ -4,7 +4,7 @@
         "overview": {
             "title": "Trial credentials",
             "transformation": {
-                "fields": ["status", "email", "username", "password", "host", "m3u_url", "error"]
+                "fields": ["status", "email", "username", "password", "host", "m3u_url", "player_updated", "error"]
             },
             "display": {
                 "component": "table",
@@ -15,6 +15,7 @@
                     "password": { "label": "Password" },
                     "host": { "label": "Server" },
                     "m3u_url": { "label": "M3U URL" },
+                    "player_updated": { "label": "Player updated" },
                     "error": { "label": "Error" }
                 }
             }

@@ -56,8 +56,22 @@
             "description": "Which mailbox to use for receiving the credentials email. 'mailcx' uses api.mail.cx (requires an API token below); 'boomlify' uses boomlify.com's free web inbox (no key or captcha; add an API key below to use its paid API instead); 'tmaily' allocates a disposable tmaily.com inbox per run; 'gmail' uses a real Gmail inbox with a unique plus-addressed alias per run (best deliverability); the others are disposable-email APIs.",
             "editor": "select",
             "default": "mailcx",
-            "enum": ["mailcx", "boomlify", "tmaily", "gmail", "procmail", "mailtm"],
-            "enumTitles": ["mail.cx (default)", "boomlify.com (free)", "tmaily.com", "Gmail plus-addressing", "procmail.xyz", "mail.tm (fallback)"]
+            "enum": [
+                "mailcx",
+                "boomlify",
+                "tmaily",
+                "gmail",
+                "procmail",
+                "mailtm"
+            ],
+            "enumTitles": [
+                "mail.cx (default)",
+                "boomlify.com (free)",
+                "tmaily.com",
+                "Gmail plus-addressing",
+                "procmail.xyz",
+                "mail.tm (fallback)"
+            ]
         },
         "emailFallbacks": {
             "title": "Email fallback backends",
@@ -92,8 +106,18 @@
             "description": "API mode only: how long the Boomlify address lives (free web inboxes last ~2 months). Must outlast the email wait (up to 45 min), so 10min is too short.",
             "editor": "select",
             "default": "1day",
-            "enum": ["10min", "1hour", "1day", "permanent"],
-            "enumTitles": ["10 minutes", "1 hour", "1 day (default)", "Permanent"]
+            "enum": [
+                "10min",
+                "1hour",
+                "1day",
+                "permanent"
+            ],
+            "enumTitles": [
+                "10 minutes",
+                "1 hour",
+                "1 day (default)",
+                "Permanent"
+            ]
         },
         "boomlifyDomains": {
             "title": "Boomlify preferred domains",
@@ -197,6 +221,38 @@
             "description": "Display name for the saved playlist.",
             "editor": "textfield",
             "default": "IPTVV Canada"
+        },
+        "playerApiUrl": {
+            "title": "Player API URL",
+            "type": "string",
+            "description": "Address of the IPTV player's online playlist manager.",
+            "editor": "textfield",
+            "default": "https://iptv-playlists.hi-lux-store.workers.dev"
+        },
+        "playerDeviceId": {
+            "title": "Player device ID",
+            "type": "string",
+            "description": "Device ID shown on the TV (Settings → Sources → Manage online). The player playlist is updated when device ID, key and playlist ID are set.",
+            "editor": "textfield"
+        },
+        "playerDeviceKey": {
+            "title": "Player device key",
+            "type": "string",
+            "description": "Device key shown on the TV (sent as the Bearer token).",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "playerPlaylistId": {
+            "title": "Player playlist ID",
+            "type": "string",
+            "description": "ID of the playlist to update on the player.",
+            "editor": "textfield"
+        },
+        "playerPlaylistName": {
+            "title": "Player playlist name",
+            "type": "string",
+            "description": "Optional. New name for the playlist; the current name is kept when empty.",
+            "editor": "textfield"
         },
         "m3uUrl": {
             "title": "M3U URL (GitHub update only)",
