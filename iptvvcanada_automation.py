@@ -158,7 +158,13 @@ CREDENTIALS_EMAIL_SUBJECTS = [
     "Free 24-Hour IPTV Trial Subscription",  # Current IPTVV format
     "Your trial is now active",               # Legacy/alternate format
     "IPTV Trial Subscription",                # Partial match
+    "Your free trial login is ready",         # Format seen 2026-11
+    "trial login",                            # Partial match of the above
 ]
+
+# Message ids from IPTVV whose body was already fetched and found not to hold
+# credentials, so the body-sniffing fallback doesn't refetch them every poll.
+_non_credential_message_ids = set()
 solver = TwoCaptcha(TWOCAPTCHA_API_KEY) if TWOCAPTCHA_API_KEY else None
 
 
@@ -334,13 +340,28 @@ def _scan_messages_for_credentials(messages, fetch_full):
             )
 
         # Check if this is the credentials email (check multiple subject patterns)
-        for pattern in CREDENTIALS_EMAIL_SUBJECTS:
-            if pattern.lower() in lowered_subject:
-                print("[OK] Credentials email found!")
-                full_message = fetch_full(msg)
-                if full_message:
+        if any(pattern.lower() in lowered_subject for pattern in CREDENTIALS_EMAIL_SUBJECTS):
+            print("[OK] Credentials email found!")
+            full_message = fetch_full(msg)
+            if full_message:
+                return full_message
+            continue
+
+        # Fallback for unknown subjects: any IPTVV email whose body mentions
+        # both a username and a password is treated as the credentials email.
+        msg_key = msg.get("id") or f"{from_addr}|{subject}"
+        if "iptvv" in from_addr.lower() and msg_key not in _non_credential_message_ids:
+            full_message = fetch_full(msg)
+            if full_message:
+                body = full_message.get("text", "") or ""
+                html_part = full_message.get("html", "")
+                if isinstance(html_part, list):
+                    html_part = " ".join(html_part)
+                body = f"{body} {html_part or ''}".lower()
+                if "username" in body and "password" in body:
+                    print(f"[OK] Credentials email found (body match, unrecognised subject: {subject!r})")
                     return full_message
-                break
+                _non_credential_message_ids.add(msg_key)
 
     return None
 
@@ -2888,6 +2909,11 @@ def extract_credentials_from_email(message):
                 hostname = url.rstrip(".,)")
                 print(f"[*] Found hostname (fallback): {hostname}")
                 break
+
+    if not username or not password or not hostname:
+        print(f"[!] Incomplete credentials (username={bool(username)}, "
+              f"password={bool(password)}, hostname={bool(hostname)}). Full email body:")
+        print(re.sub(r"\n\s*\n+", "\n", normalized).strip()[:3000])
 
     return username, password, hostname
 
