@@ -2,7 +2,7 @@
 
 Reads the Actor input, maps it onto the environment variables that
 ``iptvvcanada_automation`` reads at import time, runs the (synchronous,
-Selenium-based) flow in a worker thread, and reports the result to the Apify
+Puppeteer-driven) flow in a worker thread, and reports the result to the Apify
 dataset / key-value store and, optionally, to a webhook callback.
 """
 import asyncio

@@ -9,13 +9,15 @@ a webhook and IBO Player).
 
 | Path | Purpose |
 | --- | --- |
-| `iptvvcanada_automation.py` | Core Selenium automation (also runnable as a CLI). `run_automation()` returns the credentials. |
+| `iptvvcanada_automation.py` | Core automation (also runnable as a CLI). `run_automation()` returns the credentials. |
+| `browser/checkout.js` | Puppeteer worker (`puppeteer-extra` + stealth plugin) that drives the checkout in real Chrome. Python talks to it over JSON lines. |
+| `puppeteer_client.py` | Python client that starts the worker and sends it commands. |
 | `src/main.py` | Apify wrapper: input → env vars → `run_automation()` → dataset/OUTPUT/webhook. |
 | `src/__main__.py` | Entry point (`python -m src`). |
 | `.actor/actor.json` | Actor definition. |
 | `.actor/input_schema.json` | Input fields shown in the Apify console. |
 | `.actor/dataset_schema.json` | Dataset table view. |
-| `Dockerfile` | Built on `apify/actor-python-selenium` (Chrome preinstalled). |
+| `Dockerfile` | Built on `apify/actor-python-selenium` (Chrome preinstalled), plus Node.js for the Puppeteer worker. |
 | `requirements.txt` | Python dependencies. |
 
 ## Deploy to Apify
@@ -61,6 +63,7 @@ marked failed.
 
 ```bash
 pip install -r requirements.txt
+(cd browser && npm ci)                      # Node >= 18; uses your installed Google Chrome
 python iptvvcanada_automation.py            # full run
 python iptvvcanada_automation.py --preflight-only
 ```

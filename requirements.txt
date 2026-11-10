@@ -7,14 +7,10 @@ pydantic ~= 2.10.0
 # crawlee's browserforge workaround still calls. 1.2.3 is the only version that
 # both imports cleanly and satisfies crawlee's >=1.2.3 requirement.
 browserforge == 1.2.3
-selenium ~= 4.27
-undetected-chromedriver ~= 3.5
-webdriver-manager ~= 4.0
+# The browser checkout runs in Node/Puppeteer (browser/package.json).
 2captcha-python ~= 1.5
 python-dotenv ~= 1.0
 requests ~= 2.32
-# undetected-chromedriver imports distutils, removed from the Python 3.12 stdlib.
-setuptools >= 70.0
 # SVG rasterization for the IBO Player device-login captcha (needs libcairo2,
 # installed via the Dockerfile). Pulls in Pillow + cairocffi.
 cairosvg ~= 2.7

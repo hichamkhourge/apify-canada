@@ -4,7 +4,10 @@ IPTVV Canada - Automated Trial Account Creation
 Automates the IPTVV.ca cart checkout flow using temporary mail.tm emails
 and extracts Xtream credentials from the received email.
 
-Install deps: pip install selenium webdriver-manager 2captcha-python python-dotenv requests
+The browser checkout runs in a Node/Puppeteer worker (browser/checkout.js, using
+puppeteer-extra + the stealth plugin); everything else is plain HTTP from Python.
+
+Install deps: pip install -r requirements.txt && (cd browser && npm ci)
 """
 import argparse
 import base64
@@ -17,25 +20,16 @@ import re
 import select
 import socket
 import string
-import subprocess
-import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 import requests
 from dotenv import load_dotenv
-import undetected_chromedriver as uc
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import Select, WebDriverWait
 from twocaptcha import TwoCaptcha
-from webdriver_manager.chrome import ChromeDriverManager
 
 import iboplayer_auth
 import player_api
+from puppeteer_client import PuppeteerCheckout, WorkerError
 
 load_dotenv()
 
@@ -1462,7 +1456,7 @@ def wait_for_credentials_email(driver, session, max_wait_seconds=EMAIL_MAX_WAIT_
 
 
 # ═══════════════════════════════════════════════════════════
-# Selenium Browser Automation
+# Browser Automation (Puppeteer worker: browser/checkout.js)
 # ═══════════════════════════════════════════════════════════
 
 def get_random_user_agent():
@@ -1476,22 +1470,6 @@ def get_random_user_agent():
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
     ]
     return random.choice(user_agents)
-
-
-def get_chrome_major_version(chrome_binary):
-    """Return the installed Chrome major version, or None if undetectable."""
-    override = os.getenv("CHROME_VERSION_MAIN", "").strip()
-    if override.isdigit():
-        return int(override)
-    if not chrome_binary:
-        return None
-    try:
-        output = subprocess.check_output([chrome_binary, "--version"], text=True, timeout=15)
-        match = re.search(r"(\d+)\.", output)
-        return int(match.group(1)) if match else None
-    except Exception as e:
-        print(f"[!] Could not detect Chrome version from {chrome_binary}: {e}")
-        return None
 
 
 # Holds the running local forwarding proxy so its listener thread isn't GC'd.
@@ -1616,445 +1594,48 @@ class _ForwardingProxy:
                     pass
 
 
-def _build_proxy_auth_extension(proxy_url):
-    """Write an unpacked Chrome extension that routes traffic through proxy_url.
-
-    Chrome's --proxy-server flag can't carry credentials, so for an authenticated
-    proxy we ship a tiny extension that (1) sets fixed_servers to the proxy host
-    and (2) answers the proxy's auth challenge with the embedded username/password.
-
-    Args:
-        proxy_url: full proxy URL, e.g. "http://user:pass@host:8000".
-
-    Returns:
-        Path to a temp directory holding manifest.json + background.js, or None
-        if the URL can't be parsed.
-    """
-    from urllib.parse import urlparse
-
-    parsed = urlparse(proxy_url)
-    host, port = parsed.hostname, parsed.port
-    if not host or not port:
-        print(f"[!] Invalid IPTVV_PROXY_URL (need host:port): {proxy_url!r}")
-        return None
-    scheme = "https" if parsed.scheme in ("https", "socks5") else "http"
-    user = parsed.username or ""
-    password = parsed.password or ""
-
-    ext_dir = tempfile.mkdtemp(prefix="proxy_auth_ext_")
-    manifest = {
-        "name": "Proxy Auth",
-        "version": "1.0.0",
-        "manifest_version": 2,
-        "permissions": [
-            "proxy", "tabs", "unlimitedStorage", "storage",
-            "<all_urls>", "webRequest", "webRequestBlocking",
-        ],
-        "background": {"scripts": ["background.js"], "persistent": True},
-        "minimum_chrome_version": "22.0.0",
-    }
-    background_js = """
-var config = {
-    mode: "fixed_servers",
-    rules: {
-        singleProxy: { scheme: "%(scheme)s", host: "%(host)s", port: parseInt(%(port)s) },
-        bypassList: ["localhost"]
-    }
-};
-chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
-function callbackFn(details) {
-    return { authCredentials: { username: "%(user)s", password: "%(password)s" } };
-}
-chrome.webRequest.onAuthRequired.addListener(
-    callbackFn,
-    { urls: ["<all_urls>"] },
-    ["blocking"]
-);
-""" % {"scheme": scheme, "host": host, "port": port, "user": user, "password": password}
-
-    with open(os.path.join(ext_dir, "manifest.json"), "w") as fh:
-        json.dump(manifest, fh)
-    with open(os.path.join(ext_dir, "background.js"), "w") as fh:
-        fh.write(background_js)
-
-    safe_host = f"{host}:{port}"
-    print(f"[*] Proxy auth extension built for {scheme}://{safe_host} (auth: {'yes' if user else 'no'})")
-    return ext_dir
-
-
 def get_driver():
-    """Initialize Chrome WebDriver with anti-detection options (undetected-chromedriver).
+    """Start the Puppeteer checkout worker (puppeteer-extra + stealth, real Chrome).
 
-    Routes browser egress through IPTVV_PROXY_URL when set (residential proxy),
-    otherwise uses a direct connection on the host's public IP.
+    Returns a ``PuppeteerCheckout`` client, which stands in for the old Selenium
+    driver: the checkout helpers below take it as their ``driver`` argument.
+
+    Browser egress goes through IPTVV_PROXY_URL when set (residential proxy) via
+    the local no-auth forwarding proxy; otherwise it uses a direct connection.
     """
-    headless_mode = os.getenv("HEADLESS", "False").lower() == "true"
-
-    # Use undetected-chromedriver's ChromeOptions
-    options = uc.ChromeOptions()
-
-    # Container-stability flags are needed whether headless or headed (under Xvfb).
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-
-    if headless_mode:
-        # new-headless Chrome does not reliably run extension background scripts,
-        # which breaks the proxy-auth extension. Prefer headed mode under Xvfb.
-        options.add_argument("--headless=new")
-        print("[*] Running in HEADLESS mode")
-    else:
-        print("[*] Running in headed mode (virtual display / Xvfb)")
-
-    # Use random user agent for additional anonymity
-    random_ua = get_random_user_agent()
-    options.add_argument(f"--user-agent={random_ua}")
-    print(f"[*] Using User-Agent: {random_ua[:80]}...")
-
-    # Additional anti-detection options
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--disable-popup-blocking")
-    options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--disable-logging")
-    options.add_argument("--log-level=3")
-    options.add_argument("--disable-notifications")
-
-    # Additional preferences to appear more human-like
-    prefs = {
-        "credentials_enable_service": False,
-        "profile.password_manager_enabled": False,
-        "profile.default_content_setting_values.notifications": 2,
-        "profile.managed_default_content_settings.images": 1,  # Enable images
-    }
-
-    # Route through the residential proxy when configured; otherwise force a
-    # direct connection. A datacenter IP (e.g. Apify/AWS) gets IP-blocked by
-    # IPTVV's Cloudflare, so IPTVV_PROXY_URL should point at a residential exit.
     global _local_proxy
-    local_proxy_port = None
+    proxy_server = None
     if IPTVV_PROXY_URL:
         try:
             _local_proxy = _ForwardingProxy(IPTVV_PROXY_URL)
-            local_proxy_port = _local_proxy.start()
+            port = _local_proxy.start()
+            proxy_server = f"http://127.0.0.1:{port}"
+            print(f"[*] Routing browser through local forwarding proxy 127.0.0.1:{port} "
+                  "-> upstream residential proxy")
         except Exception as exc:
-            print(f"[!] Failed to start local forwarding proxy: {exc}")
-            local_proxy_port = None
-    if local_proxy_port:
-        # Chrome talks to a no-auth localhost proxy; the forwarder injects the
-        # upstream residential proxy's credentials. This avoids the unreliable
-        # in-browser auth extension that returns empty pages under uc.
-        options.add_argument(f"--proxy-server=http://127.0.0.1:{local_proxy_port}")
-        options.add_argument("--proxy-bypass-list=<-loopback>")
-        print(f"[*] Routing browser through local forwarding proxy 127.0.0.1:{local_proxy_port} "
-              "-> upstream residential proxy")
-    else:
-        if IPTVV_PROXY_URL:
-            print("[!] Proxy requested but forwarder unavailable; falling back to direct connection")
-        # Explicitly disable any proxy to prevent ERR_NO_SUPPORTED_PROXIES from a
-        # leaked system/env proxy setting.
-        options.add_argument("--no-proxy-server")
-        prefs["proxy"] = {
-            "mode": "direct",
-            "pac_url": "",
-            "bypass_list": ""
-        }
-        print("[*] Using direct connection (public IP, no proxy)")
+            print(f"[!] Failed to start local forwarding proxy: {exc}; falling back to direct connection")
+            proxy_server = None
 
-    options.add_experimental_option("prefs", prefs)
-
-    # Pin the real Chrome binary so undetected-chromedriver never auto-selects a
-    # broken snap wrapper (e.g. /usr/lib/chromium-browser, which raises
-    # PermissionError on some hosts). CHROME_BINARY overrides; otherwise pick the
-    # first installed Google Chrome (in Docker this resolves to google-chrome-stable).
-    chrome_binary = os.getenv("CHROME_BINARY", "").strip()
-    if not chrome_binary:
-        for candidate in ("/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"):
-            if os.path.exists(candidate):
-                chrome_binary = candidate
-                break
-    if chrome_binary:
-        options.binary_location = chrome_binary
-        print(f"[*] Using Chrome binary: {chrome_binary}")
-
-    # Pin version_main to the installed Chrome; without it undetected-chromedriver
-    # downloads the latest driver, which can be one major ahead of the browser
-    # bundled in the Apify base image (e.g. driver 150 vs Chrome 149).
-    version_main = get_chrome_major_version(chrome_binary)
-    if version_main:
-        print(f"[*] Detected Chrome major version: {version_main}")
-
-    # Use undetected-chromedriver (no need for chromedriver path, it manages itself)
-    try:
-        print("[*] Initializing undetected-chromedriver...")
-        driver = uc.Chrome(options=options, use_subprocess=False, version_main=version_main)
-        print("[OK] undetected-chromedriver initialized successfully")
-    except Exception as e:
-        print(f"[!] Failed to initialize undetected-chromedriver: {e}")
-        print("[*] Falling back to regular ChromeDriver...")
-        # Fallback to regular webdriver if undetected fails
-        chromedriver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
-        if os.path.exists(chromedriver_path):
-            service = Service(chromedriver_path)
-        else:
-            service = Service(ChromeDriverManager().install())
-
-        regular_options = Options()
-
-        # Copy all arguments from uc.ChromeOptions to regular Options
-        for arg in options.arguments:
-            regular_options.add_argument(arg)
-
-        # Copy experimental options (prefs)
-        if hasattr(options, 'experimental_options'):
-            for key, value in options.experimental_options.items():
-                regular_options.add_experimental_option(key, value)
-
-        driver = webdriver.Chrome(service=service, options=regular_options)
-
-    return driver
-
-
-def safe_click(driver, el):
-    """Safely click an element with fallback to JavaScript click."""
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-    time.sleep(0.4)
-    try:
-        el.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", el)
-
-
-def find_clickable_by_text(driver, terms, timeout=15):
-    """Find a clickable element containing any of the given text terms."""
-    terms = [term.lower() for term in terms]
-    end = time.time() + timeout
-    while time.time() < end:
-        candidates = driver.find_elements(
-            By.XPATH,
-            "//a|//button|//input[@type='submit' or @type='button']|//label|//*[@role='button']",
-        )
-        for el in candidates:
-            if not el.is_displayed() or not el.is_enabled():
-                continue
-            text = " ".join(
-                filter(
-                    None,
-                    [
-                        el.text,
-                        el.get_attribute("value"),
-                        el.get_attribute("title"),
-                        el.get_attribute("aria-label"),
-                    ],
-                )
-            ).lower()
-            if any(term in text for term in terms):
-                return el
-        time.sleep(0.5)
-    raise TimeoutError(f"Could not find clickable element containing: {terms}")
-
-
-def page_text_lower(driver):
-    """Return visible body text, lowercased, without failing page checks."""
-    try:
-        return driver.find_element(By.TAG_NAME, "body").text.lower()
-    except Exception:
-        return ""
-
-
-def is_cloudflare_block_page(driver):
-    """Detect Cloudflare/WAF pages that replace the real WooCommerce checkout."""
-    title = (driver.title or "").lower()
-    current_url = (driver.current_url or "").lower()
-    body = page_text_lower(driver)
-    markers = [
-        "attention required",
-        "cloudflare",
-        "checking your browser",
-        "verify you are human",
-        "cf-browser-verification",
-        "ray id",
-        "error 1020",
-        "access denied",
-    ]
-    return (
-        "cloudflare" in title
-        or "cdn-cgi" in current_url
-        or any(marker in body for marker in markers)
+    client = PuppeteerCheckout(
+        proxy_server=proxy_server,
+        env_overrides={
+            "IPTVV_BASE_URL": IPTVV_BASE_URL,
+            "IPTVV_CART_URL": IPTVV_CART_URL,
+            "IPTVV_TRIAL_PRODUCT_ID": IPTVV_TRIAL_PRODUCT_ID,
+            "IPTVV_PROXY_CHECK_URL": IPTVV_PROXY_CHECK_URL,
+            "IPTVV_CLOUDFLARE_WAIT_SECONDS": IPTVV_CLOUDFLARE_WAIT_SECONDS,
+            "IPTVV_PAGE_LOAD_RETRIES": IPTVV_PAGE_LOAD_RETRIES,
+            "IPTVV_DEBUG_DIR": IPTVV_DEBUG_DIR,
+        },
     )
-
-
-def is_browser_error_page(driver):
-    """Detect Chrome's own network-error screen (NOT a Cloudflare block).
-
-    Chrome renders these (e.g. ERR_NO_SUPPORTED_PROXIES, DNS failures, timeouts)
-    when it never reaches the site at all, so they must not be mistaken for a
-    Cloudflare/WAF block or a missing checkout form.
-    """
-    body = page_text_lower(driver)
-    current_url = (driver.current_url or "").lower()
-    markers = [
-        "this site can't be reached",
-        "this site can’t be reached",
-        "err_",
-        "dns_probe_finished",
-        "took too long to respond",
-        "your internet access is blocked",
-        "no internet",
-    ]
-    return current_url.startswith("chrome-error://") or any(marker in body for marker in markers)
-
-
-def log_page_diagnostics(driver, label):
-    """Print inline page diagnostics so the failure is visible in the run log.
-
-    Dumps URL, title, body-text length + preview, HTML length + head snippet, and
-    classifies common blank-page causes (proxy 407, Cloudflare JS challenge,
-    Chrome error page, empty document). Avoids needing the saved artifacts.
-    """
-    print(f"[diag] ===== page diagnostics ({label}) =====")
     try:
-        print(f"[diag] current_url: {driver.current_url}")
-        print(f"[diag] title: {driver.title!r}")
-    except Exception as exc:
-        print(f"[diag] could not read url/title: {exc}")
-
-    body_text = ""
-    try:
-        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
-    except Exception as exc:
-        print(f"[diag] could not read body text: {exc}")
-    print(f"[diag] body text length: {len(body_text)}")
-    if body_text:
-        preview = re.sub(r"\s+", " ", body_text)[:500]
-        print(f"[diag] body text preview: {preview}")
-
-    html = ""
-    try:
-        html = driver.page_source or ""
-    except Exception as exc:
-        print(f"[diag] could not read page_source: {exc}")
-    print(f"[diag] page_source length: {len(html)}")
-    if html:
-        snippet = re.sub(r"\s+", " ", html)[:1200]
-        print(f"[diag] page_source head: {snippet}")
-
-    lowered = (body_text + " " + html).lower()
-    classifications = []
-    if any(m in lowered for m in ("proxy authentication required", "407", "err_tunnel_connection_failed",
-                                   "err_proxy_connection_failed", "err_no_supported_proxies")):
-        classifications.append("PROXY AUTH / TUNNEL FAILURE (407) - the auth extension is not supplying credentials")
-    if any(m in lowered for m in ("just a moment", "checking your browser", "cf-challenge", "challenge-platform")):
-        classifications.append("CLOUDFLARE JS CHALLENGE (interstitial, not a hard block)")
-    if any(m in lowered for m in ("your cart is currently empty", "your cart is empty", "no products in the cart")):
-        classifications.append("EMPTY CART (trial product was never added)")
-    if driver_current_url_is_error(driver):
-        classifications.append("CHROME ERROR PAGE (never reached the site)")
-    if len(html) < 200 and len(body_text) < 5:
-        classifications.append("ESSENTIALLY EMPTY DOCUMENT (blank response)")
-    print(f"[diag] classification: {', '.join(classifications) if classifications else 'unknown - inspect DEBUG_PAGE'}")
-
-    # When the browser shows an empty document, hit the same URL through the same
-    # proxy with requests to reveal the raw HTTP status/headers the browser hides.
-    # This distinguishes a silent Cloudflare/site block (403/503/empty 200) from a
-    # proxy problem, and shows whether the residential exit reaches the origin.
-    if IPTVV_PROXY_URL and len(html) < 200:
-        probe_url = driver.current_url if (driver.current_url or "").startswith("http") else IPTVV_BASE_URL
-        _proxy_probe(probe_url)
-    print("[diag] ===================================")
-
-
-def _proxy_probe(url):
-    """GET url through IPTVV_PROXY_URL with requests and log the raw response."""
-    try:
-        import urllib3
-        urllib3.disable_warnings()
-    except Exception:
-        pass
-    try:
-        resp = requests.get(
-            url,
-            proxies={"http": IPTVV_PROXY_URL, "https": IPTVV_PROXY_URL},
-            headers={"User-Agent": get_random_user_agent()},
-            timeout=30,
-            verify=False,
-            allow_redirects=True,
-        )
-        body = re.sub(r"\s+", " ", resp.text or "")[:800]
-        print(f"[diag] proxy probe {url} -> HTTP {resp.status_code} {resp.reason}, {len(resp.content)} bytes")
-        print(f"[diag] proxy probe headers: server={resp.headers.get('Server')!r} "
-              f"cf-ray={resp.headers.get('CF-Ray')!r} cf-mitigated={resp.headers.get('cf-mitigated')!r} "
-              f"content-type={resp.headers.get('Content-Type')!r}")
-        print(f"[diag] proxy probe body head: {body}")
-    except Exception as exc:
-        print(f"[diag] proxy probe failed: {type(exc).__name__}: {exc}")
-
-
-def driver_current_url_is_error(driver):
-    """True if Chrome is showing its own error page (chrome-error://)."""
-    try:
-        return (driver.current_url or "").lower().startswith("chrome-error://")
-    except Exception:
-        return False
-
-
-def driver_current_url_is_error(driver):
-    """True if Chrome is showing its own error page (chrome-error://)."""
-    try:
-        return (driver.current_url or "").lower().startswith("chrome-error://")
-    except Exception:
-        return False
-
-
-def save_page_debug_artifacts(driver, label):
-    """Save a screenshot and HTML snapshot for production diagnosis."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "_", label).strip("_") or "page"
-    debug_dir = IPTVV_DEBUG_DIR
-    artifacts = {}
-
-    # Try to create/access the debug directory, fallback to user-writable locations
-    fallback_dirs = [debug_dir, "./logs", os.path.expanduser("~/logs"), "/tmp"]
-    debug_dir_accessible = False
-
-    for candidate_dir in fallback_dirs:
-        try:
-            os.makedirs(candidate_dir, exist_ok=True)
-            # Test write access by creating a test file
-            test_file = os.path.join(candidate_dir, f".write_test_{os.getpid()}")
-            with open(test_file, "w") as f:
-                f.write("test")
-            os.remove(test_file)
-            debug_dir = candidate_dir
-            debug_dir_accessible = True
-            if candidate_dir != IPTVV_DEBUG_DIR:
-                print(f"[*] Using fallback debug directory: {debug_dir}")
-            break
-        except Exception as exc:
-            if candidate_dir == fallback_dirs[-1]:
-                print(f"[!] Could not access any debug directory, last error: {exc}")
-            continue
-
-    base_path = os.path.join(debug_dir, f"iptvv_{safe_label}_{timestamp}")
-
-    try:
-        screenshot_path = f"{base_path}.png"
-        driver.save_screenshot(screenshot_path)
-        print(f"[*] Screenshot saved to: {screenshot_path}")
-        artifacts["screenshot"] = screenshot_path
-    except Exception as exc:
-        print(f"[!] Could not save screenshot: {exc}")
-
-    try:
-        html_path = f"{base_path}.html"
-        with open(html_path, "w", encoding="utf-8") as fh:
-            fh.write(driver.page_source)
-        print(f"[*] HTML snapshot saved to: {html_path}")
-        artifacts["html"] = html_path
-    except Exception as exc:
-        print(f"[!] Could not save HTML snapshot: {exc}")
-
-    return artifacts
+        print("[*] Starting Puppeteer checkout worker...")
+        client.start()
+    except WorkerError as exc:
+        client.close()
+        raise RuntimeError(f"Failed to start Puppeteer browser: {exc}") from exc
+    print("[OK] Puppeteer browser initialized")
+    return client
 
 
 def get_public_ip():
@@ -2068,58 +1649,47 @@ def get_public_ip():
         return "unknown"
 
 
-def extract_cloudflare_diagnostics(driver):
-    """Extract useful Cloudflare details from the block page."""
-    source = driver.page_source or ""
-    page_text = html.unescape(re.sub(r"<[^>]+>", " ", source))
-    page_text = re.sub(r"\s+", " ", page_text).strip()
-
-    ray_id = "unknown"
-    ray_match = re.search(r"Ray ID:?\s*([0-9a-fA-F]{12,})", page_text)
-    if ray_match:
-        ray_id = ray_match.group(1)
-
-    reason = "Cloudflare/WAF block page"
-    reason_patterns = [
-        r"You are unable to access[^.]*\.?",
-        r"Sorry, you have been blocked\.?",
-        r"Attention Required![^.]*\.?",
-        r"Access denied\.?",
-    ]
-    for pattern in reason_patterns:
-        match = re.search(pattern, page_text, flags=re.IGNORECASE)
-        if match:
-            reason = match.group(0).strip()
-            break
-
-    return {
-        "ray_id": ray_id,
-        "reason": reason,
-        "url": driver.current_url,
-        "title": driver.title,
-    }
-
-
 def get_browser_public_ip(driver):
-    """Fetch public IP from inside Chrome to verify VPN/browser egress."""
-    original_url = driver.current_url
+    """Fetch the public IP as seen from inside Chrome (proxied egress)."""
     try:
-        driver.get(IPTVV_PROXY_CHECK_URL)
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        browser_ip = driver.find_element(By.TAG_NAME, "body").text.strip()
-        browser_ip = re.sub(r"\s+", " ", browser_ip)
-        if browser_ip:
-            return browser_ip
-        return "unknown"
+        return driver.browser_ip() or "unknown"
     except Exception as exc:
         print(f"[!] Could not fetch browser public IP from {IPTVV_PROXY_CHECK_URL}: {exc}")
         return "unknown"
-    finally:
-        if original_url and original_url != "data:,":
-            try:
-                driver.get(original_url)
-            except Exception:
-                pass
+
+
+def _translate_worker_error(driver, exc, prefix=""):
+    """Map a worker error onto this module's exception types, with IP diagnostics."""
+    diag = exc.diag or {}
+    artifacts = diag.get("artifacts") or {}
+    artifact_text = (f"debug HTML: {artifacts.get('html', 'not saved')}; "
+                     f"screenshot: {artifacts.get('screenshot', 'not saved')}")
+
+    if exc.type == "cloudflare_blocked":
+        # Container egress (requests, NOT proxied) vs browser egress (goes through
+        # IPTVV_PROXY_URL when set). If they match, the residential proxy isn't applied.
+        public_ip = get_public_ip()
+        browser_ip = get_browser_public_ip(driver)
+        print(f"[!] Cloudflare Ray ID: {diag.get('ray_id', 'unknown')}")
+        print(f"[!] Cloudflare reason: {diag.get('reason', 'unknown')}")
+        print(f"[!] Container public IP (unproxied): {public_ip}")
+        print(f"[!] Browser-visible public IP (proxied egress): {browser_ip}")
+        if IPTVV_PROXY_URL and browser_ip not in ("unknown", "") and browser_ip == public_ip:
+            print("[!] Browser IP equals container IP despite IPTVV_PROXY_URL being set "
+                  "-> residential proxy is NOT taking effect.")
+        elif not IPTVV_PROXY_URL:
+            print("[!] No IPTVV_PROXY_URL set -> browser is on the datacenter IP (no proxy).")
+        return CloudflareBlockedError(
+            f"{prefix}{exc} "
+            f"Container IP: {public_ip}; browser IP: {browser_ip}; "
+            f"Cloudflare Ray ID: {diag.get('ray_id', 'unknown')}; {artifact_text}. "
+            "Ask IPTVV/Cloudflare to allowlist this server or provide an approved API/integration path."
+        )
+
+    location = ""
+    if diag.get("url") or diag.get("title"):
+        location = f" Current URL: {diag.get('url')}; title: {diag.get('title')};"
+    return RuntimeError(f"{prefix}{exc}{location} {artifact_text}".strip())
 
 
 def preflight_checkout_access():
@@ -2146,55 +1716,12 @@ def preflight_checkout_access():
         if server_ip != "unknown" and browser_ip != "unknown" and server_ip == browser_ip:
             print("[*] Browser IP matches server IP; this is expected for full-system VPN egress.")
 
-        print("[*] Seeding free-trial cart for checkout preflight...")
-        driver.get(f"{IPTVV_BASE_URL}/?add-to-cart={IPTVV_TRIAL_PRODUCT_ID}")
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(5)
-
-        print(f"[*] Opening checkout: {checkout_url}")
-        driver.get(checkout_url)
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(5)
-
-        artifacts = save_page_debug_artifacts(driver, "preflight_checkout")
-        print(f"[*] Checkout URL after load: {driver.current_url}")
-        print(f"[*] Page title: {driver.title}")
-
-        if is_cloudflare_block_page(driver):
-            diagnostics = extract_cloudflare_diagnostics(driver)
-            print(f"[!] Cloudflare Ray ID: {diagnostics['ray_id']}")
-            print(f"[!] Cloudflare reason: {diagnostics['reason']}")
-            raise CloudflareBlockedError(
-                "Preflight failed: IPTVV checkout is blocked by Cloudflare/WAF. "
-                f"Server IP: {server_ip}; browser IP: {browser_ip}; "
-                f"Cloudflare Ray ID: {diagnostics['ray_id']}; "
-                f"debug HTML: {artifacts.get('html', 'not saved')}; "
-                f"screenshot: {artifacts.get('screenshot', 'not saved')}."
-            )
-
-        if is_browser_error_page(driver):
-            print("[!] Chrome rendered a network-error page (NOT a Cloudflare block)")
-            raise RuntimeError(
-                "Preflight failed: network/connectivity error - Chrome never reached IPTVV "
-                "(this is NOT a Cloudflare IP block; check DNS/egress/leftover proxy settings). "
-                f"Server IP: {server_ip}; browser IP: {browser_ip}; "
-                f"Current URL: {driver.current_url}; title: {driver.title}; "
-                f"debug HTML: {artifacts.get('html', 'not saved')}; "
-                f"screenshot: {artifacts.get('screenshot', 'not saved')}."
-            )
-
         try:
-            driver.find_element(By.ID, "billing_email")
-        except Exception:
-            raise RuntimeError(
-                "Preflight failed: no Cloudflare block and no network error detected, "
-                "but the checkout billing_email field is missing (unexpected page layout). "
-                f"Server IP: {server_ip}; browser IP: {browser_ip}; "
-                f"Current URL: {driver.current_url}; title: {driver.title}; "
-                f"debug HTML: {artifacts.get('html', 'not saved')}; "
-                f"screenshot: {artifacts.get('screenshot', 'not saved')}."
-            )
+            result = driver.preflight()
+        except WorkerError as exc:
+            raise _translate_worker_error(driver, exc) from exc
 
+        artifacts = (result or {}).get("artifacts") or {}
         print("[OK] Preflight passed: IPTVV checkout form is reachable.")
         print(f"[OK] Server IP: {server_ip}")
         print(f"[OK] Browser-visible IP: {browser_ip}")
@@ -2204,85 +1731,8 @@ def preflight_checkout_access():
 
     finally:
         if driver:
-            try:
-                driver.quit()
-                print("[*] Browser closed")
-            except Exception:
-                pass
-
-
-def wait_for_real_checkout_page(driver, context, timeout=30):
-    """Wait until the WooCommerce checkout appears, or fail on a blocker page."""
-    print(f"[*] Verifying checkout page after {context}...")
-    deadline = time.time() + timeout
-    cloudflare_seen = False
-    reload_attempts = 0
-
-    while time.time() < deadline:
-        if is_cloudflare_block_page(driver):
-            cloudflare_seen = True
-            print("[!] Cloudflare/WAF page detected instead of checkout; waiting for clearance...")
-            if reload_attempts < IPTVV_PAGE_LOAD_RETRIES:
-                reload_attempts += 1
-                print(f"[*] Reloading page after blocker detection ({reload_attempts}/{IPTVV_PAGE_LOAD_RETRIES})...")
-                driver.refresh()
-            time.sleep(5)
-            continue
-
-        try:
-            driver.find_element(By.ID, "billing_email")
-            print("[OK] Billing email field detected - checkout form is loaded")
-            return True
-        except Exception:
-            time.sleep(1)
-
-    if cloudflare_seen or is_cloudflare_block_page(driver):
-        artifacts = save_page_debug_artifacts(driver, "cloudflare_block")
-        diagnostics = extract_cloudflare_diagnostics(driver)
-        # Container egress (requests, NOT proxied) vs browser egress (goes through
-        # IPTVV_PROXY_URL when set). Compare the two: if the browser IP still equals
-        # the container's AWS IP, the residential proxy is not being applied.
-        public_ip = get_public_ip()
-        browser_ip = get_browser_public_ip(driver)
-        print(f"[!] Cloudflare Ray ID: {diagnostics['ray_id']}")
-        print(f"[!] Cloudflare reason: {diagnostics['reason']}")
-        print(f"[!] Container public IP (unproxied): {public_ip}")
-        print(f"[!] Browser-visible public IP (proxied egress): {browser_ip}")
-        if IPTVV_PROXY_URL and browser_ip not in ("unknown", "") and browser_ip == public_ip:
-            print("[!] Browser IP equals container IP despite IPTVV_PROXY_URL being set "
-                  "-> residential proxy is NOT taking effect.")
-        elif not IPTVV_PROXY_URL:
-            print("[!] No IPTVV_PROXY_URL set -> browser is on the datacenter IP (no proxy).")
-        raise CloudflareBlockedError(
-            "IPTVV checkout is blocked by Cloudflare/WAF in this production container. "
-            "The checkout form never loaded. "
-            f"Container IP: {public_ip}; browser IP: {browser_ip}; "
-            f"Cloudflare Ray ID: {diagnostics['ray_id']}; "
-            f"debug HTML: {artifacts.get('html', 'not saved')}; "
-            f"screenshot: {artifacts.get('screenshot', 'not saved')}. "
-            "Ask IPTVV/Cloudflare to allowlist this server or provide an approved API/integration path."
-        )
-
-    artifacts = save_page_debug_artifacts(driver, "checkout_not_loaded")
-    log_page_diagnostics(driver, "checkout_not_loaded")
-    page_text = page_text_lower(driver)
-    empty_cart_markers = (
-        "your cart is currently empty",
-        "your cart is empty",
-        "no products in the cart",
-        "cart is currently empty",
-    )
-    empty_cart_hint = (
-        " (page shows an empty cart - the trial product was never added)"
-        if any(marker in page_text for marker in empty_cart_markers)
-        else ""
-    )
-    raise RuntimeError(
-        f"IPTVV checkout form did not load after {context}{empty_cart_hint}. "
-        f"Current URL: {driver.current_url}; title: {driver.title}; "
-        f"debug HTML: {artifacts.get('html', 'not saved')}; "
-        f"screenshot: {artifacts.get('screenshot', 'not saved')}"
-    )
+            driver.close()
+            print("[*] Browser closed")
 
 
 def generate_random_user_data():
@@ -2312,503 +1762,86 @@ def generate_random_user_data():
 
 
 # ═══════════════════════════════════════════════════════════
-# IPTVV.ca Automation Functions
+# IPTVV.ca Automation Functions (executed by browser/checkout.js)
 # ═══════════════════════════════════════════════════════════
 
-def find_add_to_cart_control(driver, timeout=10):
-    """Find the control that actually adds the trial product to the cart.
-
-    Prefer anchors whose href performs the WooCommerce add-to-cart (the
-    "START MY FREE TRIAL" button); matching by label alone can hit the
-    "Get Free Trial" link, which only opens the /iptv-free-trial/ landing
-    page without touching the cart.
-    """
-    end = time.time() + timeout
-    while time.time() < end:
-        for el in driver.find_elements(By.CSS_SELECTOR, "a[href*='add-to-cart']"):
-            if el.is_displayed() and el.is_enabled():
-                return el
-        time.sleep(0.5)
-    return find_clickable_by_text(
-        driver,
-        ["start my free trial", "start free trial", "add to cart"],
-        timeout=10,
-    )
-
-
-def cart_has_items(driver):
-    """Load the cart page and report whether it contains at least one item."""
-    driver.get(IPTVV_CART_URL)
-    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(2)
-    if driver.find_elements(By.CSS_SELECTOR, ".cart_item"):
-        return True
-    if "your cart is currently empty" in page_text_lower(driver):
-        return False
-    # Unknown layout: proceed and let the checkout verification decide.
-    return True
-
-
-def open_checkout_and_verify(driver, context):
-    """Navigate to the checkout page and wait for the real WooCommerce form."""
-    checkout_url = f"{IPTVV_BASE_URL}/checkout/"
-    print(f"[*] Navigating to checkout: {checkout_url}")
-    driver.get(checkout_url)
-    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(5)
-
-    # Wait for document to be fully ready
-    for _ in range(10):
-        if driver.execute_script("return document.readyState") == "complete":
-            break
-        time.sleep(1)
-
-    print(f"[*] Checkout URL: {driver.current_url}")
-    print(f"[*] Page title: {driver.title}")
-    wait_for_real_checkout_page(driver, context, timeout=IPTVV_CLOUDFLARE_WAIT_SECONDS)
-
-
 def navigate_to_cart_and_get_free_trial(driver):
-    """Add the free-trial product to the cart and open checkout (WooCommerce flow)."""
-    print(f"[*] Navigating to IPTVV cart: {IPTVV_CART_URL}")
-    driver.get(IPTVV_CART_URL)
-    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(2)
-    print(f"[*] Current URL: {driver.current_url}")
+    """Add the free-trial product to the cart, open checkout and pick the full package.
 
-    print("[*] Looking for the add-to-cart trial button...")
+    Waits out Cloudflare challenges; raises CloudflareBlockedError / RuntimeError
+    when the checkout form never loads.
+    """
     try:
-        trial_button = find_add_to_cart_control(driver, timeout=10)
-        label = trial_button.text or trial_button.get_attribute("href")
-        print(f"[OK] Found element: {label}")
-        safe_click(driver, trial_button)
-        print("[OK] Clicked trial button - adding product to cart...")
-        time.sleep(5)
-        print(f"[*] After click URL: {driver.current_url}")
-    except TimeoutError:
-        print("[!] Add-to-cart trial button not found")
-        # First page of the flow: dump diagnostics so we can tell whether the
-        # cart page itself came back blank (proxy issue) or just lacks the button.
-        log_page_diagnostics(driver, "cart_button_not_found")
-
-    if not cart_has_items(driver):
-        print("[*] Cart is still empty; trying direct add-to-cart URL...")
-        driver.get(f"{IPTVV_BASE_URL}/?add-to-cart={IPTVV_TRIAL_PRODUCT_ID}")
-        time.sleep(8)  # Wait longer for product to be added
-        print(f"[*] After add-to-cart URL: {driver.current_url}")
-        if not cart_has_items(driver):
-            print("[!] Cart still looks empty after direct add-to-cart; continuing to checkout anyway")
-
-    try:
-        open_checkout_and_verify(driver, "free-trial cart flow")
-    except RuntimeError:
-        if "/cart" not in driver.current_url:
-            raise
-        print("[!] Checkout bounced back to the cart; re-adding trial product and retrying once...")
-        driver.get(f"{IPTVV_BASE_URL}/?add-to-cart={IPTVV_TRIAL_PRODUCT_ID}")
-        time.sleep(8)
-        open_checkout_and_verify(driver, "direct add-to-cart retry")
-
-
-def select_full_channel_package(driver):
-    """Select 'full channel' option from dropdown or radio buttons."""
-    print("[*] Looking for 'full channel' option...")
-
-    # Strategy 1: Check dropdowns/select elements
-    for select_el in driver.find_elements(By.TAG_NAME, "select"):
-        select = Select(select_el)
-        options_text = " ".join([opt.text.lower() for opt in select.options])
-
-        if "channel" in options_text or "package" in options_text or "plan" in options_text:
-            print(f"[*] Found dropdown with channel options")
-            for option in select.options:
-                if "full" in option.text.lower() and "channel" in option.text.lower():
-                    select.select_by_visible_text(option.text)
-                    print(f"[OK] Selected: {option.text}")
-                    return True
-            # If no exact match, select the most comprehensive option (usually last or contains 'all')
-            for option in select.options:
-                if "all" in option.text.lower() or "full" in option.text.lower():
-                    select.select_by_visible_text(option.text)
-                    print(f"[OK] Selected: {option.text}")
-                    return True
-
-    # Strategy 2: Check radio buttons
-    radio_buttons = driver.find_elements(By.XPATH, "//input[@type='radio']")
-    for radio in radio_buttons:
-        label_text = ""
-        try:
-            # Try to find associated label
-            radio_id = radio.get_attribute("id")
-            if radio_id:
-                label = driver.find_element(By.XPATH, f"//label[@for='{radio_id}']")
-                label_text = label.text.lower()
-        except:
-            # Try parent element text
-            label_text = radio.find_element(By.XPATH, "./parent::*").text.lower()
-
-        if "full" in label_text and "channel" in label_text:
-            safe_click(driver, radio)
-            print(f"[OK] Selected radio button: {label_text}")
-            return True
-
-    # Strategy 3: Check checkboxes
-    checkboxes = driver.find_elements(By.XPATH, "//input[@type='checkbox']")
-    for checkbox in checkboxes:
-        label_text = ""
-        try:
-            checkbox_id = checkbox.get_attribute("id")
-            if checkbox_id:
-                label = driver.find_element(By.XPATH, f"//label[@for='{checkbox_id}']")
-                label_text = label.text.lower()
-        except:
-            label_text = checkbox.find_element(By.XPATH, "./parent::*").text.lower()
-
-        if "full" in label_text and "channel" in label_text:
-            if not checkbox.is_selected():
-                safe_click(driver, checkbox)
-            print(f"[OK] Checked: {label_text}")
-            return True
-
-    print("[*] Could not find 'full channel' option - may not be required or already selected")
-    return False
+        driver.open_trial_checkout()
+    except WorkerError as exc:
+        raise _translate_worker_error(driver, exc) from exc
 
 
 def fill_checkout_form(driver, email_address):
-    """Fill WooCommerce checkout form with generated data and mail.tm email."""
-    print("[*] Filling WooCommerce checkout form...")
-
-    wait_for_real_checkout_page(driver, "form fill step", timeout=IPTVV_CLOUDFLARE_WAIT_SECONDS)
-    time.sleep(2)  # Extra time for all form fields to render
-
+    """Fill the WooCommerce checkout form with generated data and the given email."""
     user_data = generate_random_user_data()
     user_data["email"] = email_address
-
-    # WooCommerce standard billing field names
-    field_mappings = {
-        "email": ["billing_email", "email"],
-        "first_name": ["billing_first_name", "firstname", "first_name"],
-        "last_name": ["billing_last_name", "lastname", "last_name"],
-        "phone": ["billing_phone", "phone"],
-        "address": ["billing_address_1", "address", "address1"],
-        "city": ["billing_city", "city"],
-        "postal_code": ["billing_postcode", "postal", "postcode", "zip"],
-        "country": ["billing_country", "country"],
-    }
-
-    # Try to fill each field
-    filled_fields = []
-    for data_key, field_names in field_mappings.items():
-        value = user_data.get(data_key, "")
-        if not value:
-            continue
-
-        filled = False
-        for field_name in field_names:
-            # Try by ID first (WooCommerce uses IDs), then name
-            for by_type in [By.ID, By.NAME]:
-                try:
-                    field = driver.find_element(by_type, field_name)
-                    if field.is_displayed() and field.is_enabled():
-                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", field)
-                        time.sleep(0.3)
-                        field.clear()
-                        field.send_keys(value)
-                        print(f"[OK] Filled {field_name}: {value if data_key != 'email' else email_address}")
-                        filled = True
-                        filled_fields.append(field_name)
-                        break
-                except:
-                    pass
-            if filled:
-                break
-
-        if not filled:
-            print(f"[!] Could not find field for: {data_key}")
-
-    # Handle country dropdown (WooCommerce uses select2 sometimes)
     try:
-        # Try standard select
-        country_select = driver.find_element(By.ID, "billing_country")
-        select = Select(country_select)
-        for option in select.options:
-            if "ca" == option.get_attribute("value").lower() or "canada" in option.text.lower():
-                select.select_by_value(option.get_attribute("value"))
-                print(f"[OK] Selected country: Canada")
-                filled_fields.append("billing_country")
-                break
-    except:
-        # Try by name if ID doesn't work
-        try:
-            country_select = driver.find_element(By.NAME, "billing_country")
-            select = Select(country_select)
-            select.select_by_value("CA")
-            print(f"[OK] Selected country: CA")
-            filled_fields.append("billing_country")
-        except:
-            print("[!] Could not find country dropdown")
-
-    # WooCommerce often has a state/province field
-    try:
-        state_select = driver.find_element(By.ID, "billing_state")
-        select = Select(state_select)
-        # Select Ontario (ON) as default
-        select.select_by_value("ON")
-        print(f"[OK] Selected state: Ontario")
-        filled_fields.append("billing_state")
-    except:
-        pass
-
-    # IPTVV.ca CUSTOM REQUIRED FIELDS
-    # Handle "Device Select" checkboxes (required by IPTVV.ca)
-    print("[*] Looking for device selection checkboxes...")
-    device_filled = False
-    try:
-        # Find device checkboxes by name="device_select[]"
-        device_checkboxes = driver.find_elements(By.NAME, "device_select[]")
-        if device_checkboxes:
-            print(f"[*] Found {len(device_checkboxes)} device checkboxes")
-            # Check the first device checkbox (Android TV Box or Firestick)
-            for checkbox in device_checkboxes:
-                value = checkbox.get_attribute("value") or ""
-                # Prefer Android Box or Smart TV
-                if value in ["androidbox", "smarttv", "firetv"]:
-                    if not checkbox.is_selected():
-                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", checkbox)
-                        time.sleep(0.3)
-                        safe_click(driver, checkbox)
-                        print(f"[OK] Selected device: {value}")
-                        filled_fields.append("device_select")
-                        device_filled = True
-                        break
-
-            # Fallback: check first device if none selected
-            if not device_filled and len(device_checkboxes) > 0:
-                checkbox = device_checkboxes[0]
-                if not checkbox.is_selected():
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", checkbox)
-                    time.sleep(0.3)
-                    safe_click(driver, checkbox)
-                    value = checkbox.get_attribute("value") or "first"
-                    print(f"[OK] Selected device (first): {value}")
-                    filled_fields.append("device_select")
-                    device_filled = True
-        else:
-            print("[!] No device checkboxes found with name='device_select[]'")
-    except Exception as e:
-        print(f"[!] Device checkbox error: {e}")
-
-    # Handle "Billing Channel Packages" field (required by IPTVV.ca)
-    # This might be a multiselect, checkbox group, or hidden field
-    try:
-        # Strategy 1: Try to find checkboxes or radio buttons for packages
-        package_checkboxes = driver.find_elements(By.XPATH, "//input[@type='checkbox' and (contains(@id, 'channel') or contains(@name, 'channel') or contains(@id, 'package') or contains(@name, 'package'))]")
-        if package_checkboxes:
-            # Check all packages (or first one for "full channel")
-            for checkbox in package_checkboxes[:1]:  # Select first/main package
-                if not checkbox.is_selected():
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", checkbox)
-                    time.sleep(0.3)
-                    safe_click(driver, checkbox)
-                    print(f"[OK] Selected channel package checkbox")
-                    filled_fields.append("billing_channel_packages")
-                    break
-
-        # Strategy 2: Try to find a select dropdown for packages
-        else:
-            for package_id in ["billing_channel_packages", "billing_packages", "channel_packages", "packages"]:
-                try:
-                    package_field = driver.find_element(By.ID, package_id)
-                    if package_field.tag_name == "select":
-                        select = Select(package_field)
-                        # Select option containing "full" or "all" or just first option
-                        selected = False
-                        for option in select.options:
-                            if "full" in option.text.lower() or "all" in option.text.lower():
-                                select.select_by_visible_text(option.text)
-                                print(f"[OK] Selected package: {option.text}")
-                                filled_fields.append("billing_channel_packages")
-                                selected = True
-                                break
-                        if not selected and len(select.options) > 1:
-                            select.select_by_index(1)
-                            print(f"[OK] Selected package (first option): {select.options[1].text}")
-                            filled_fields.append("billing_channel_packages")
-                        break
-                except:
-                    continue
-    except Exception as e:
-        print(f"[!] Could not find or fill channel packages field: {e}")
-
-    print(f"[OK] Filled {len(filled_fields)} fields: {', '.join(filled_fields)}")
-    print(f"[*] Using email: {email_address}")
+        driver.fill(email_address, user_data)
+    except WorkerError as exc:
+        raise _translate_worker_error(driver, exc) from exc
     return user_data
 
 
-def solve_recaptcha_v2(driver, timeout=120, max_retries=2):
-    """Solve reCAPTCHA v2 using 2captcha service."""
-    if not solver:
-        print("[*] 2captcha solver not configured; checking if CAPTCHA exists...")
-        has_captcha = any("recaptcha" in (iframe.get_attribute("src") or "")
-                         for iframe in driver.find_elements(By.TAG_NAME, "iframe"))
-        if has_captcha:
-            print("[!] reCAPTCHA detected but TWOCAPTCHA_API_KEY not set")
-            if os.getenv("HEADLESS", "True").lower() != "true":
-                input("[*] Please solve the CAPTCHA manually in the browser, then press ENTER here...")
-                return True
-            return False
-        return True
+def solve_recaptcha_v2(driver, max_retries=2):
+    """Solve the checkout reCAPTCHA v2 (if any) with 2captcha.
 
-    site_key = None
-    for iframe in driver.find_elements(By.TAG_NAME, "iframe"):
-        src = iframe.get_attribute("src") or ""
-        if "recaptcha" in src and "api2/anchor" in src and "k=" in src:
-            site_key = src.split("k=", 1)[1].split("&", 1)[0]
-            break
-
-    if not site_key:
+    Returns:
+        (ok, token): token is None when there is no captcha or it was solved by hand.
+    """
+    info = driver.captcha_info()
+    if not info:
         print("[*] No reCAPTCHA iframe found")
-        return True
+        return True, None
 
-    print(f"[*] Solving reCAPTCHA with site key: {site_key}")
+    if not solver:
+        print("[!] reCAPTCHA detected but TWOCAPTCHA_API_KEY not set")
+        if os.getenv("HEADLESS", "True").lower() != "true":
+            input("[*] Please solve the CAPTCHA manually in the browser, then press ENTER here...")
+            return True, None
+        return False, None
+
+    print(f"[*] Solving reCAPTCHA with site key: {info['sitekey']}")
     for attempt in range(1, max_retries + 1):
         try:
-            result = solver.recaptcha(sitekey=site_key, url=driver.current_url, version="v2", invisible=0)
-            token = result["code"]
-            driver.execute_script(
-                """
-                var textarea = document.getElementById('g-recaptcha-response');
-                if (textarea) {
-                    textarea.value = arguments[0];
-                    textarea.innerHTML = arguments[0];
-                    textarea.dispatchEvent(new Event('change', {bubbles:true}));
-                }
-                var el = document.querySelector('.g-recaptcha');
-                if (el) {
-                    var callback = el.getAttribute('data-callback');
-                    if (callback && typeof window[callback] === 'function') {
-                        window[callback](arguments[0]);
-                    }
-                }
-                """,
-                token,
-            )
-            print("[OK] reCAPTCHA token injected")
-            time.sleep(2)
-            return True
+            result = solver.recaptcha(sitekey=info["sitekey"], url=info["url"], version="v2", invisible=0)
+            return True, result["code"]
         except Exception as exc:
             print(f"[!] reCAPTCHA attempt {attempt}/{max_retries} failed: {exc}")
             if attempt < max_retries:
                 time.sleep(5)
-    return False
+    return False, None
 
 
 def submit_checkout_form(driver):
-    """Submit the WooCommerce checkout form."""
-    print("[*] Submitting WooCommerce checkout form...")
-    wait_for_real_checkout_page(driver, "submit step", timeout=IPTVV_CLOUDFLARE_WAIT_SECONDS)
-
-    # Solve CAPTCHA if present
-    if not solve_recaptcha_v2(driver):
+    """Solve the captcha and submit the WooCommerce checkout form."""
+    ok, token = solve_recaptcha_v2(driver)
+    if not ok:
         raise RuntimeError("Failed to solve reCAPTCHA")
 
-    # WooCommerce usually has a button with ID "place_order"
-    submit_btn = None
     try:
-        # Try WooCommerce standard button ID
-        submit_btn = driver.find_element(By.ID, "place_order")
-        print(f"[OK] Found WooCommerce place_order button")
-    except:
-        # Fallback to text search
-        try:
-            submit_btn = find_clickable_by_text(
-                driver,
-                ["place order", "place trial order", "submit", "checkout", "complete order"],
-                timeout=15
-            )
-            print(f"[OK] Found submit button: {submit_btn.text}")
-        except TimeoutError:
-            print("[!] Could not find submit button")
+        result = driver.submit(token)
+    except WorkerError as exc:
+        if exc.type == "submit_not_found":
+            raise RuntimeError("Could not find or click submit button") from exc
+        raise _translate_worker_error(driver, exc) from exc
 
-    if submit_btn:
-        # Scroll to button
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", submit_btn)
-        time.sleep(1)
+    outcome = (result or {}).get("outcome")
+    if outcome == "disposable_rejected":
+        raise DisposableEmailRejectedError(
+            "IPTVV rejected the email address as temporary/disposable; "
+            "use the 'gmail' backend (a permanent address)."
+        )
+    if outcome == "still_checkout":
+        errors = "; ".join(result.get("errors") or []) or "no WooCommerce error message found"
+        print(f"[!] Checkout validation error(s): {errors}")
+    return result
 
-        # Click submit
-        safe_click(driver, submit_btn)
-        print("[OK] Submit button clicked")
-
-        # Wait for processing/redirect (WooCommerce shows processing animation)
-        print("[*] Waiting for order processing...")
-        time.sleep(10)  # WooCommerce needs more time to process
-        print(f"[*] After submit URL: {driver.current_url}")
-
-        # Check if we got redirected to thank you / order received page
-        if "order-received" in driver.current_url or "thank-you" in driver.current_url:
-            print("[OK] Order successfully submitted! (on thank you page)")
-        elif "checkout" in driver.current_url:
-            # Still on checkout - might be validation errors
-            print("[!] WARNING: Still on checkout page - order submission failed")
-
-            # Save screenshot for debugging
-            try:
-                screenshot_path = "/tmp/iptvv_checkout_error.png"
-                driver.save_screenshot(screenshot_path)
-                print(f"[*] Screenshot saved to: {screenshot_path}")
-            except:
-                pass
-
-            # Try to find error messages
-            try:
-                error_msg = driver.find_element(By.CSS_SELECTOR, ".woocommerce-error, .woocommerce-NoticeGroup-checkout, .woocommerce-notices-wrapper")
-                print(f"[!] Checkout validation error: {error_msg.text}")
-                # Print full page errors for debugging
-                all_errors = driver.find_elements(By.CSS_SELECTOR, ".woocommerce-error li, .woocommerce-NoticeGroup-checkout li")
-                if all_errors:
-                    for i, err in enumerate(all_errors, 1):
-                        print(f"    Error {i}: {err.text}")
-            except:
-                print("[*] No error message found via CSS selectors")
-
-            # A disposable-domain rejection can never recover by waiting for mail.
-            try:
-                checkout_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-            except Exception:
-                checkout_text = ""
-            if "disposable email" in checkout_text or "temporary or disposable" in checkout_text:
-                raise DisposableEmailRejectedError(
-                    "IPTVV rejected the email address as temporary/disposable; "
-                    "use the 'gmail' backend (a permanent address)."
-                )
-
-            # Check for inline field errors
-            try:
-                field_errors = driver.find_elements(By.CSS_SELECTOR, ".woocommerce-invalid-required-field, [aria-invalid='true']")
-                if field_errors:
-                    print(f"[!] Found {len(field_errors)} invalid/required fields:")
-                    for field in field_errors:
-                        field_name = field.get_attribute("name") or field.get_attribute("id") or "unknown"
-                        print(f"    - {field_name}")
-            except:
-                pass
-
-            # Print page source snippet around errors
-            try:
-                page_text = driver.find_element(By.TAG_NAME, "body").text
-                if "error" in page_text.lower():
-                    print("[*] Page contains 'error' keyword - checking...")
-                    lines = page_text.split("\n")
-                    for i, line in enumerate(lines):
-                        if "error" in line.lower() or "required" in line.lower() or "invalid" in line.lower():
-                            context_start = max(0, i-1)
-                            context_end = min(len(lines), i+2)
-                            print(f"[!] Error context: {' '.join(lines[context_start:context_end])}")
-                            break
-            except:
-                pass
-    else:
-        raise RuntimeError("Could not find or click submit button")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -3235,11 +2268,9 @@ def run_automation():
         # Step 1: Initialize browser and confirm IPTVV checkout is reachable.
         driver = get_driver()
 
-        # Step 2: Navigate to cart and start trial process.
+        # Steps 2-3: Add the trial to the cart, open checkout (waiting out any
+        # Cloudflare challenge) and select the full channel package.
         navigate_to_cart_and_get_free_trial(driver)
-
-        # Step 3: Select full channel package.
-        select_full_channel_package(driver)
 
         # Steps 4-6: allocate an address, fill and submit checkout. If IPTVV
         # rejects the address as disposable, retry on the same checkout page
@@ -3320,9 +2351,9 @@ def run_automation():
     finally:
         if driver and AUTO_EXIT:
             try:
-                driver.quit()
+                driver.close()
                 print("[*] Browser closed")
-            except:
+            except Exception:
                 pass
         elif driver:
             print("[*] AUTO_EXIT disabled; browser will remain open")
