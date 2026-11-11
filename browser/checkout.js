@@ -564,6 +564,39 @@ async function typeInto(el, value) {
   await el.type(String(value), { delay: rand(25, 70) });
 }
 
+/**
+ * Tick one checkbox in the group named `name`: the first whose (value, label)
+ * matches `prefer`, else the first one. Returns what was selected and how many
+ * boxes in the group are checked afterwards, or null if the group is absent.
+ */
+async function selectCheckboxGroup(name, prefer) {
+  const boxes = await page.$$(`input[name="${name}"]`);
+  if (!boxes.length) return null;
+  let target = null;
+  let picked = null;
+  for (const cb of boxes) {
+    const value = await cb.evaluate((n) => n.value || '');
+    const label = await labelTextFor(cb);
+    if (prefer(value.toLowerCase(), label)) { target = cb; picked = { value, label: label.trim() }; break; }
+  }
+  if (!target) {
+    target = boxes[0];
+    picked = { value: await target.evaluate((n) => n.value || 'first'), label: (await labelTextFor(target)).trim() };
+  }
+  if (!(await target.evaluate((n) => n.checked))) await safeClick(target);
+  if (!(await target.evaluate((n) => n.checked))) {
+    // Click didn't stick (custom styled input / overlay): set it and fire the events.
+    await target.evaluate((n) => {
+      n.checked = true;
+      n.dispatchEvent(new Event('input', { bubbles: true }));
+      n.dispatchEvent(new Event('change', { bubbles: true }));
+      if (window.jQuery) window.jQuery(n).trigger('change');
+    });
+  }
+  const checkedCount = await page.$$eval(`input[name="${name}"]`, (els) => els.filter((e) => e.checked).length);
+  return { ...picked, checkedCount, total: boxes.length };
+}
+
 async function setSelectValue(id, predicate) {
   return page.evaluate((selId, predSrc) => {
     const sel = document.getElementById(selId) || document.querySelector(`[name="${selId}"]`);
@@ -625,28 +658,31 @@ async function cmdFill({ email, user_data: userData }) {
 
   // IPTVV custom required field: device_select[] checkboxes.
   log('[*] Looking for device selection checkboxes...');
-  const devices = await page.$$('[name="device_select[]"]');
-  if (devices.length) {
-    log(`[*] Found ${devices.length} device checkboxes`);
-    let target = null;
-    for (const cb of devices) {
-      const value = await cb.evaluate((n) => n.value || '');
-      if (['androidbox', 'smarttv', 'firetv'].includes(value)) { target = cb; break; }
-    }
-    target = target || devices[0];
-    const [value, checked] = await target.evaluate((n) => [n.value || 'first', n.checked]);
-    if (!checked) await safeClick(target);
-    log(`[OK] Selected device: ${value}`);
+  const device = await selectCheckboxGroup('device_select[]',
+    (value) => ['androidbox', 'smarttv', 'firetv'].includes(value));
+  if (device) {
+    log(`[OK] Selected device: ${device.value} (${device.checkedCount}/${device.total} checked)`);
     filled.push('device_select');
   } else {
     log("[!] No device checkboxes found with name='device_select[]'");
   }
 
-  // IPTVV custom required field: channel packages (checkbox or select).
-  const pkgBoxes = await page.$$(
+  // IPTVV custom required field: channels_select[] checkboxes (channel package).
+  const channels = await selectCheckboxGroup('channels_select[]',
+    (value, label) => /full|all/.test(`${value} ${label}`));
+  if (channels) {
+    log(`[OK] Selected channel package: ${channels.label || channels.value} `
+      + `(${channels.checkedCount}/${channels.total} checked)`);
+    filled.push('channels_select');
+  }
+
+  // Fallback: other channel-package field shapes (checkbox or select).
+  const pkgBoxes = channels ? [] : await page.$$(
     "input[type='checkbox'][id*='channel'], input[type='checkbox'][name*='channel'], "
     + "input[type='checkbox'][id*='package'], input[type='checkbox'][name*='package']");
-  if (pkgBoxes.length) {
+  if (channels) {
+    // already handled above
+  } else if (pkgBoxes.length) {
     const checked = await pkgBoxes[0].evaluate((n) => n.checked);
     if (!checked) await safeClick(pkgBoxes[0]);
     log('[OK] Selected channel package checkbox');
@@ -847,6 +883,78 @@ async function injectSecurityToken(token, type) {
   await sleep(2000);
 }
 
+/** Summarize the posted checkout form (names + the fields that matter). */
+function summarizePostData(postData) {
+  if (!postData) return null;
+  try {
+    const params = new URLSearchParams(postData);
+    const names = [...new Set([...params.keys()])];
+    return {
+      fields: names,
+      device_select: params.getAll('device_select[]'),
+      channels_select: params.getAll('channels_select[]'),
+      billing_email: params.get('billing_email'),
+      turnstile_token_length: (params.get('cf-turnstile-response') || '').length,
+    };
+  } catch { return { raw_length: postData.length }; }
+}
+
+function classifyCheckoutAjax(info) {
+  const body = info.body || '';
+  const lower = body.toLowerCase();
+  const cf = info.headers['cf-mitigated'] || lower.includes('cloudflare') || lower.includes('cf-chl');
+  if ([403, 429, 503].includes(info.status) && cf) return { outcome: 'cloudflare_blocked' };
+  if (info.status >= 500) return { outcome: 'server_error' };
+  let json = null;
+  try { json = JSON.parse(body); } catch {
+    // Plugins sometimes echo output before the JSON; try from the first brace.
+    const i = body.indexOf('{');
+    if (i > 0) { try { json = JSON.parse(body.slice(i)); } catch { /* not JSON */ } }
+  }
+  if (info.status < 200 || info.status >= 300) return { outcome: 'http_error' };
+  if (!json) return { outcome: 'non_json' };
+  if (json.result === 'success') return { outcome: 'success', redirect: json.redirect || null };
+  if (json.result === 'failure') {
+    const messages = String(json.messages || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    return { outcome: 'failure_messages', messages };
+  }
+  return { outcome: 'unexpected_json' };
+}
+
+/** Watch for the WooCommerce checkout AJAX POST and capture its response. */
+function watchCheckoutAjax() {
+  let resolveDone;
+  const done = new Promise((r) => { resolveDone = r; });
+  let captured = null;
+  const handler = async (res) => {
+    if (captured || !res.url().includes('wc-ajax=checkout')) return;
+    captured = { pending: true };
+    const headers = res.headers();
+    let body = '';
+    try { body = await res.text(); } catch (exc) { body = `<unreadable: ${exc.message}>`; }
+    const info = {
+      url: res.url(),
+      status: res.status(),
+      headers: {
+        'content-type': headers['content-type'] || null,
+        'cf-ray': headers['cf-ray'] || null,
+        'cf-mitigated': headers['cf-mitigated'] || null,
+        server: headers.server || null,
+      },
+      body: body.slice(0, 1500),
+      posted: summarizePostData(res.request().postData()),
+    };
+    Object.assign(info, classifyCheckoutAjax({ ...info, body }));
+    captured = info;
+    resolveDone(info);
+  };
+  page.on('response', handler);
+  return {
+    wait: (ms) => Promise.race([done, sleep(ms).then(() => null)]),
+    stop: () => page.off('response', handler),
+  };
+}
+
 async function cmdSubmit({ token, type } = {}) {
   requirePage();
   log('[*] Submitting WooCommerce checkout form...');
@@ -864,41 +972,68 @@ async function cmdSubmit({ token, type } = {}) {
     log('[OK] Found submit button by text');
   }
 
-  await safeClick(button);
-  log('[OK] Submit button clicked');
-  log('[*] Waiting for order processing...');
-  // WooCommerce submits via AJAX then redirects; wait for either the redirect or ~15s.
-  await pollFor(async () => /order-received|thank-you/.test(await safeUrl()), 15000, 1000);
+  const ajaxWatch = watchCheckoutAjax();
+  let ajax = null;
+  try {
+    await safeClick(button);
+    log('[OK] Submit button clicked');
+    log('[*] Waiting for order processing...');
+    // WooCommerce POSTs /?wc-ajax=checkout, then redirects on success.
+    ajax = await ajaxWatch.wait(45000);
+  } finally {
+    ajaxWatch.stop();
+  }
+  if (ajax) {
+    log(`[ajax] wc-ajax=checkout -> HTTP ${ajax.status} (${ajax.outcome}); `
+      + `content-type=${ajax.headers['content-type']} server=${ajax.headers.server} `
+      + `cf-ray=${ajax.headers['cf-ray']} cf-mitigated=${ajax.headers['cf-mitigated']}`);
+    if (ajax.messages) log(`[ajax] messages: ${ajax.messages}`);
+    if (ajax.outcome !== 'success') log(`[ajax] body: ${ajax.body.replace(/\s+/g, ' ').slice(0, 800)}`);
+    if (ajax.posted) log(`[ajax] posted: ${JSON.stringify(ajax.posted)}`);
+  } else {
+    log('[!] No wc-ajax=checkout response captured within 45s');
+  }
+
+  await pollFor(async () => /order-received|thank-you/.test(await safeUrl()),
+    ajax && ajax.outcome === 'success' ? 20000 : 3000, 1000);
   await sleep(2000);
   const url = await safeUrl();
   log(`[*] After submit URL: ${url}`);
 
   if (/order-received|thank-you/.test(url)) {
     log('[OK] Order successfully submitted! (on thank you page)');
-    return { outcome: 'submitted', url, errors: [] };
+    return { outcome: 'submitted', url, errors: [], ajax };
   }
 
-  if (!url.includes('checkout')) return { outcome: 'unknown', url, errors: [] };
+  if (!url.includes('checkout')) return { outcome: 'unknown', url, errors: [], ajax };
 
   log('[!] WARNING: Still on checkout page - order submission failed');
   const artifacts = await saveDebugArtifacts('checkout_error');
   const { errors, invalidFields, text } = await page.evaluate(() => ({
-    errors: Array.from(document.querySelectorAll(
+    errors: [...new Set(Array.from(document.querySelectorAll(
       '.woocommerce-error li, .woocommerce-NoticeGroup-checkout li, .woocommerce-error'))
-      .map((e) => e.innerText.trim()).filter(Boolean),
+      .map((e) => e.innerText.trim()).filter(Boolean))],
     invalidFields: Array.from(document.querySelectorAll('.woocommerce-invalid-required-field, [aria-invalid="true"]'))
       .map((e) => e.getAttribute('name') || e.id || 'unknown'),
     text: (document.body && document.body.innerText) || '',
   }));
+  if (ajax && ajax.messages && !errors.includes(ajax.messages)) errors.push(ajax.messages);
   errors.forEach((e, i) => log(`    Error ${i + 1}: ${e}`));
   if (invalidFields.length) log(`[!] Found ${invalidFields.length} invalid/required fields: ${invalidFields.join(', ')}`);
 
-  const lower = text.toLowerCase();
+  const lower = `${text} ${(ajax && ajax.messages) || ''}`.toLowerCase();
   const outcome = (lower.includes('disposable email') || lower.includes('temporary or disposable'))
     ? 'disposable_rejected' : 'still_checkout';
   const securityCheckFailed = errors.some((e) => e.toLowerCase().includes('security check'));
   return {
-    outcome, url, errors, invalid_fields: invalidFields, artifacts, security_check_failed: securityCheckFailed,
+    outcome,
+    url,
+    errors,
+    invalid_fields: invalidFields,
+    artifacts,
+    security_check_failed: securityCheckFailed,
+    ajax,
+    ajax_outcome: ajax ? ajax.outcome : 'no_response',
   };
 }
 

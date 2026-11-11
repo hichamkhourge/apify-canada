@@ -1912,11 +1912,21 @@ def submit_checkout_form(driver, security_check_retries=1):
             print("[*] Security check was not accepted; re-solving and resubmitting...")
             continue
         artifacts = result.get("artifacts") or {}
-        raise RuntimeError(
-            f"IPTVV checkout was not accepted: {errors}. "
+        ajax = result.get("ajax") or {}
+        ajax_outcome = result.get("ajax_outcome", "no_response")
+        ajax_text = (
+            f"checkout AJAX: {ajax_outcome}"
+            + (f", HTTP {ajax.get('status')}, cf-ray {(ajax.get('headers') or {}).get('cf-ray')}" if ajax else "")
+            + (f", body: {' '.join((ajax.get('body') or '').split())[:300]}" if ajax and ajax_outcome != "failure_messages" else "")
+        )
+        details = (
+            f"{errors}. {ajax_text}. "
             f"debug HTML: {artifacts.get('html', 'not saved')}; "
             f"screenshot: {artifacts.get('screenshot', 'not saved')}"
         )
+        if ajax_outcome == "cloudflare_blocked":
+            raise CloudflareBlockedError(f"Cloudflare blocked the IPTVV checkout submission: {details}")
+        raise RuntimeError(f"IPTVV checkout was not accepted: {details}")
     return result
 
 
