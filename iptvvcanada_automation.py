@@ -1788,58 +1788,98 @@ def fill_checkout_form(driver, email_address):
     return user_data
 
 
-def solve_recaptcha_v2(driver, max_retries=2):
-    """Solve the checkout reCAPTCHA v2 (if any) with 2captcha.
+def _solve_with_2captcha(info):
+    """Return a token for the detected widget from 2captcha (raises on failure)."""
+    kind = info.get("type")
+    sitekey, url = info.get("sitekey"), info.get("url")
+    if kind == "turnstile":
+        extra = {k: v for k, v in (("action", info.get("action")), ("data", info.get("cdata"))) if v}
+        return solver.turnstile(sitekey=sitekey, url=url, **extra)["code"]
+    if kind == "hcaptcha":
+        return solver.hcaptcha(sitekey=sitekey, url=url)["code"]
+    return solver.recaptcha(sitekey=sitekey, url=url, version="v2", invisible=0,
+                            enterprise=1 if info.get("enterprise") else 0)["code"]
+
+
+def solve_security_check(driver, max_retries=2):
+    """Pass the checkout security check (Turnstile / reCAPTCHA / hCaptcha), if any.
+
+    Turnstile is first given a chance to pass inside the stealth browser; 2captcha
+    is used when it doesn't (and for reCAPTCHA / hCaptcha).
 
     Returns:
-        (ok, token): token is None when there is no captcha or it was solved by hand.
+        (ok, token, captcha_type): token is None when there is no widget, it was
+        passed in-browser, or it was solved by hand.
     """
-    info = driver.captcha_info()
+    info = driver.security_check()
     if not info:
-        print("[*] No reCAPTCHA iframe found")
-        return True, None
+        return True, None, None
+    kind = info.get("type")
+    if info.get("solved"):
+        return True, None, kind
+
+    if not info.get("sitekey"):
+        print(f"[!] {kind} detected but its site key could not be read; submitting without a token")
+        return True, None, kind
 
     if not solver:
-        print("[!] reCAPTCHA detected but TWOCAPTCHA_API_KEY not set")
+        print(f"[!] {kind} detected but TWOCAPTCHA_API_KEY not set")
         if os.getenv("HEADLESS", "True").lower() != "true":
-            input("[*] Please solve the CAPTCHA manually in the browser, then press ENTER here...")
-            return True, None
-        return False, None
+            input("[*] Please solve the security check manually in the browser, then press ENTER here...")
+            return True, None, kind
+        return False, None, kind
 
-    print(f"[*] Solving reCAPTCHA with site key: {info['sitekey']}")
+    print(f"[*] Solving {kind} with 2captcha (site key: {info['sitekey']})")
     for attempt in range(1, max_retries + 1):
         try:
-            result = solver.recaptcha(sitekey=info["sitekey"], url=info["url"], version="v2", invisible=0)
-            return True, result["code"]
+            token = _solve_with_2captcha(info)
+            print(f"[OK] {kind} solved by 2captcha")
+            return True, token, kind
         except Exception as exc:
-            print(f"[!] reCAPTCHA attempt {attempt}/{max_retries} failed: {exc}")
+            print(f"[!] {kind} attempt {attempt}/{max_retries} failed: {exc}")
             if attempt < max_retries:
                 time.sleep(5)
-    return False, None
+    return False, None, kind
 
 
-def submit_checkout_form(driver):
-    """Solve the captcha and submit the WooCommerce checkout form."""
-    ok, token = solve_recaptcha_v2(driver)
-    if not ok:
-        raise RuntimeError("Failed to solve reCAPTCHA")
+def submit_checkout_form(driver, security_check_retries=1):
+    """Pass the security check and submit the WooCommerce checkout form.
 
-    try:
-        result = driver.submit(token)
-    except WorkerError as exc:
-        if exc.type == "submit_not_found":
-            raise RuntimeError("Could not find or click submit button") from exc
-        raise _translate_worker_error(driver, exc) from exc
+    Re-runs the security check and resubmits when IPTVV says it wasn't completed
+    (Turnstile tokens are single-use and the widget resets after a failed submit).
+    """
+    for attempt in range(security_check_retries + 1):
+        ok, token, captcha_type = solve_security_check(driver)
+        if not ok:
+            raise RuntimeError(f"Failed to solve the checkout security check ({captcha_type})")
 
-    outcome = (result or {}).get("outcome")
-    if outcome == "disposable_rejected":
-        raise DisposableEmailRejectedError(
-            "IPTVV rejected the email address as temporary/disposable; "
-            "use the 'gmail' backend (a permanent address)."
-        )
-    if outcome == "still_checkout":
+        try:
+            result = driver.submit(token, captcha_type) or {}
+        except WorkerError as exc:
+            if exc.type == "submit_not_found":
+                raise RuntimeError("Could not find or click submit button") from exc
+            raise _translate_worker_error(driver, exc) from exc
+
+        outcome = result.get("outcome")
+        if outcome == "disposable_rejected":
+            raise DisposableEmailRejectedError(
+                "IPTVV rejected the email address as temporary/disposable; "
+                "use the 'gmail' backend (a permanent address)."
+            )
+        if outcome != "still_checkout":
+            return result
+
         errors = "; ".join(result.get("errors") or []) or "no WooCommerce error message found"
         print(f"[!] Checkout validation error(s): {errors}")
+        if result.get("security_check_failed") and attempt < security_check_retries:
+            print("[*] Security check was not accepted; re-solving and resubmitting...")
+            continue
+        artifacts = result.get("artifacts") or {}
+        raise RuntimeError(
+            f"IPTVV checkout was not accepted: {errors}. "
+            f"debug HTML: {artifacts.get('html', 'not saved')}; "
+            f"screenshot: {artifacts.get('screenshot', 'not saved')}"
+        )
     return result
 
 
@@ -2291,12 +2331,22 @@ def run_automation():
                 break
             except DisposableEmailRejectedError:
                 domain = email_address.rsplit("@", 1)[-1].lower()
-                _boomlify_rejected_domains.add(domain)
-                print(f"[!] {domain} rejected as disposable (attempt {email_attempt}/"
-                      f"{IPTVV_EMAIL_REJECT_RETRIES}); add it to BOOMLIFY_BLOCKED_DOMAINS")
+                backend = email_session["backend"]
+                hint = "; add it to BOOMLIFY_BLOCKED_DOMAINS" if backend == "boomlify" else ""
+                if backend == "boomlify":
+                    _boomlify_rejected_domains.add(domain)
+                print(f"[!] {domain} ({backend}) rejected as disposable (attempt {email_attempt}/"
+                      f"{IPTVV_EMAIL_REJECT_RETRIES}){hint}")
                 if email_attempt == IPTVV_EMAIL_REJECT_RETRIES:
                     raise
-                print("[*] Retrying checkout with another address...")
+                # Fall through to the next backend (e.g. gmail) instead of
+                # burning attempts on more addresses from a rejected one.
+                remaining = [b for b in email_backends if b != backend]
+                if remaining:
+                    email_backends = remaining
+                    print(f"[*] Dropping {backend}; retrying checkout with {email_backends[0]}...")
+                else:
+                    print(f"[*] No other email backend configured; retrying {backend} with another address...")
 
         # Step 7: Wait for credentials email (this can take 5-45 minutes)
         print("\n" + "=" * 60)
