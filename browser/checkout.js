@@ -672,43 +672,186 @@ async function cmdFill({ email, user_data: userData }) {
   return { filled };
 }
 
-async function cmdCaptchaInfo() {
-  requirePage();
-  const siteKey = await page.evaluate(() => {
-    for (const f of document.querySelectorAll('iframe')) {
-      const src = f.getAttribute('src') || '';
-      const m = src.includes('recaptcha') && src.includes('api2/anchor') && src.match(/[?&]k=([^&]+)/);
-      if (m) return m[1];
+// ── Security check (captcha widget above the order button) ─────────────────
+const TURNSTILE_SITEKEY_RE = /\/(0x[0-9A-Za-z_-]{10,})\//;
+
+/** Detect a Turnstile / reCAPTCHA / hCaptcha widget on the checkout page. */
+async function detectSecurityWidget() {
+  // DOM markers (sitekey + options from the container's data-* attributes).
+  const dom = await page.evaluate(() => {
+    const attrs = (el) => el && {
+      sitekey: el.getAttribute('data-sitekey'),
+      action: el.getAttribute('data-action'),
+      cdata: el.getAttribute('data-cdata'),
+      callback: el.getAttribute('data-callback'),
+    };
+    const ts = document.querySelector('.cf-turnstile[data-sitekey], [data-sitekey^="0x"]');
+    if (ts || document.querySelector('input[name="cf-turnstile-response"]')) {
+      return { type: 'turnstile', ...(attrs(ts) || {}) };
     }
-    const el = document.querySelector('.g-recaptcha[data-sitekey]');
-    return el ? el.getAttribute('data-sitekey') : null;
-  });
-  return siteKey ? { sitekey: siteKey, url: await safeUrl() } : null;
+    const hc = document.querySelector('.h-captcha[data-sitekey]');
+    if (hc || document.querySelector('textarea[name="h-captcha-response"]')) {
+      return { type: 'hcaptcha', ...(attrs(hc) || {}) };
+    }
+    const rc = document.querySelector('.g-recaptcha[data-sitekey]');
+    if (rc) return { type: 'recaptcha', ...attrs(rc) };
+    return null;
+  }).catch(() => null);
+
+  // Frames: page.frames() also sees iframes inside closed shadow roots (Turnstile).
+  let frameInfo = null;
+  for (const frame of page.frames()) {
+    const url = frame.url() || '';
+    if (url.includes('challenges.cloudflare.com')) {
+      const m = url.match(TURNSTILE_SITEKEY_RE);
+      frameInfo = { type: 'turnstile', sitekey: m ? m[1] : null, frame };
+      break;
+    }
+    if (url.includes('hcaptcha.com') && url.includes('sitekey=')) {
+      const m = url.match(/[?&#]sitekey=([^&]+)/);
+      frameInfo = { type: 'hcaptcha', sitekey: m ? m[1] : null, frame };
+      break;
+    }
+    if (url.includes('recaptcha') && /[?&]k=/.test(url)) {
+      const m = url.match(/[?&]k=([^&]+)/);
+      frameInfo = { type: 'recaptcha', sitekey: m ? m[1] : null, enterprise: url.includes('enterprise'), frame };
+      break;
+    }
+  }
+
+  if (!dom && !frameInfo) return null;
+  const merged = { ...(frameInfo || {}), ...(dom || {}) };
+  // Prefer non-empty values from either source.
+  merged.type = (dom && dom.type) || frameInfo.type;
+  merged.sitekey = (dom && dom.sitekey) || (frameInfo && frameInfo.sitekey) || null;
+  merged.enterprise = Boolean(frameInfo && frameInfo.enterprise);
+  merged.frame = frameInfo && frameInfo.type === merged.type ? frameInfo.frame : null;
+  return merged;
 }
 
-async function injectRecaptchaToken(token) {
-  await page.evaluate((tok) => {
-    const ta = document.getElementById('g-recaptcha-response');
-    if (ta) {
-      ta.value = tok;
-      ta.innerHTML = tok;
-      ta.dispatchEvent(new Event('change', { bubbles: true }));
+async function turnstileToken() {
+  return page.evaluate(() => {
+    for (const el of document.querySelectorAll('input[name="cf-turnstile-response"]')) {
+      if (el.value) return el.value;
     }
-    const el = document.querySelector('.g-recaptcha');
-    if (el) {
-      const cb = el.getAttribute('data-callback');
+    try {
+      if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+        return window.turnstile.getResponse() || '';
+      }
+    } catch { /* no widget id */ }
+    return '';
+  }).catch(() => '');
+}
+
+async function clickTurnstileCheckbox(widget) {
+  let box = null;
+  if (widget.frame) {
+    try {
+      const el = await widget.frame.frameElement();
+      if (el) box = await el.boundingBox();
+    } catch { /* detached */ }
+  }
+  if (!box) {
+    const container = await page.$('.cf-turnstile, [data-sitekey^="0x"]');
+    if (container) box = await container.boundingBox();
+  }
+  if (!box) { log('[!] Turnstile widget box not found; cannot click checkbox'); return false; }
+  const x = box.x + Math.min(30, box.width / 2) + rand(-4, 4);
+  const y = box.y + box.height / 2 + rand(-3, 3);
+  await page.mouse.move(x - rand(40, 120), y - rand(10, 40), { steps: rand(8, 16) });
+  await page.mouse.move(x, y, { steps: rand(6, 12) });
+  await page.mouse.click(x, y, { delay: rand(40, 120) });
+  log('[*] Clicked Turnstile checkbox');
+  return true;
+}
+
+async function cmdSecurityCheck() {
+  requirePage();
+  // Lazy-loaded widgets render once the order area is on screen.
+  try {
+    const btn = await page.$('#place_order');
+    if (btn) await btn.evaluate((n) => n.scrollIntoView({ block: 'center' }));
+  } catch { /* ignore */ }
+
+  log('[*] Looking for a security check widget (Turnstile / reCAPTCHA / hCaptcha)...');
+  const widget = await pollFor(detectSecurityWidget, 20000, 1000);
+  if (!widget) {
+    log('[*] No security check widget found');
+    return null;
+  }
+  const url = await safeUrl();
+  log(`[*] Security check detected: ${widget.type} (sitekey: ${widget.sitekey || 'unknown'})`);
+
+  if (widget.type === 'turnstile') {
+    // Stealth Chrome usually passes managed Turnstile without interaction.
+    if (await pollFor(turnstileToken, 15000, 1000)) {
+      log('[OK] Turnstile passed automatically');
+      return { type: 'turnstile', solved: true, url };
+    }
+    if (await clickTurnstileCheckbox(widget) && await pollFor(turnstileToken, 10000, 1000)) {
+      log('[OK] Turnstile passed after clicking the checkbox');
+      return { type: 'turnstile', solved: true, url };
+    }
+    log('[!] Turnstile not passed in-browser; external solving needed');
+  }
+
+  return {
+    type: widget.type,
+    solved: false,
+    sitekey: widget.sitekey,
+    action: widget.action || null,
+    cdata: widget.cdata || null,
+    enterprise: widget.enterprise,
+    url,
+  };
+}
+
+async function injectSecurityToken(token, type) {
+  await page.evaluate((tok, kind) => {
+    const setVal = (el) => {
+      el.value = tok;
+      if (el.tagName === 'TEXTAREA') el.innerHTML = tok;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    const fireCallback = (selector) => {
+      const el = document.querySelector(selector);
+      const cb = el && el.getAttribute('data-callback');
       if (cb && typeof window[cb] === 'function') window[cb](tok);
+    };
+    if (kind === 'turnstile') {
+      let inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+      if (!inputs.length) {
+        // Widget renders its input inside the container; create one in the form if missing.
+        const form = document.querySelector('form.checkout, form[name="checkout"]') || document.forms[0];
+        if (form) {
+          const input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = 'cf-turnstile-response';
+          form.appendChild(input);
+          inputs = [input];
+        }
+      }
+      inputs.forEach(setVal);
+      fireCallback('.cf-turnstile, [data-sitekey^="0x"]');
+    } else if (kind === 'hcaptcha') {
+      document.querySelectorAll('textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"]')
+        .forEach(setVal);
+      fireCallback('.h-captcha');
+    } else {
+      document.querySelectorAll('#g-recaptcha-response, textarea[name="g-recaptcha-response"]').forEach(setVal);
+      fireCallback('.g-recaptcha');
     }
-  }, token);
-  log('[OK] reCAPTCHA token injected');
+  }, token, type || 'recaptcha');
+  log(`[OK] ${type || 'recaptcha'} token injected`);
   await sleep(2000);
 }
 
-async function cmdSubmit({ token } = {}) {
+async function cmdSubmit({ token, type } = {}) {
   requirePage();
   log('[*] Submitting WooCommerce checkout form...');
   await waitForRealCheckoutPage('submit step');
-  if (token) await injectRecaptchaToken(token);
+  if (token) await injectSecurityToken(token, type);
 
   let button = await findVisible('#place_order');
   if (button) {
@@ -753,7 +896,10 @@ async function cmdSubmit({ token } = {}) {
   const lower = text.toLowerCase();
   const outcome = (lower.includes('disposable email') || lower.includes('temporary or disposable'))
     ? 'disposable_rejected' : 'still_checkout';
-  return { outcome, url, errors, invalid_fields: invalidFields, artifacts };
+  const securityCheckFailed = errors.some((e) => e.toLowerCase().includes('security check'));
+  return {
+    outcome, url, errors, invalid_fields: invalidFields, artifacts, security_check_failed: securityCheckFailed,
+  };
 }
 
 async function cmdClose() {
@@ -771,7 +917,7 @@ const COMMANDS = {
   open_trial_checkout: cmdOpenTrialCheckout,
   preflight: cmdPreflight,
   fill: cmdFill,
-  captcha_info: cmdCaptchaInfo,
+  security_check: cmdSecurityCheck,
   submit: cmdSubmit,
   close: cmdClose,
 };

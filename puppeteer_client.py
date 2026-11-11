@@ -175,8 +175,9 @@ class PuppeteerCheckout:
     def fill(self, email, user_data=None):
         return self.call("fill", email=email, user_data=user_data or {})
 
-    def captcha_info(self):
-        return self.call("captcha_info", timeout=30)
+    def security_check(self):
+        """Detect (and, for Turnstile, try to pass in-browser) the checkout security check."""
+        return self.call("security_check", timeout=90)
 
-    def submit(self, token=None):
-        return self.call("submit", token=token)
+    def submit(self, token=None, captcha_type=None):
+        return self.call("submit", token=token, type=captcha_type)
