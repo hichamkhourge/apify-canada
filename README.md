@@ -48,6 +48,21 @@ All fields are optional (see `.actor/input_schema.json`). Common ones:
 - `iboPlayerEnabled` + `iboPlayerCookie` + `iboPlayerPlaylistUrlId` — push the
   playlist to IBO Player.
 
+### Gmail backend with your own domain
+
+IPTVV treats Gmail plus-aliases (`you+123@gmail.com`) as the same address as
+`you@gmail.com`, so they only ever get one trial. Use a domain you own instead:
+
+1. In Cloudflare, open the domain → **Email** → **Email Routing** → **Routing rules**.
+2. Enable the **Catch-all address** with action *Send to an email* → your Gmail
+   (it must be a verified destination address).
+3. Set the Actor input: `emailBackend` = `gmail`, `gmailAddress`,
+   `gmailAppPassword` (a Google app password), and `gmailAliasDomain` =
+   `yourdomain.com`.
+
+Each run then checks out with a fresh address like `emma.taylor4821@yourdomain.com`
+and reads the credentials email from the Gmail inbox (INBOX and Spam) over IMAP.
+
 ## Output
 
 On success the Actor pushes one dataset item and sets the `OUTPUT` record:

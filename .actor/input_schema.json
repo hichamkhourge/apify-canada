@@ -143,7 +143,7 @@
         "gmailAddress": {
             "title": "Gmail address",
             "type": "string",
-            "description": "Base Gmail address for the 'gmail' backend; each run checks out with a unique plus-addressed alias of it.",
+            "description": "Gmail inbox the 'gmail' backend reads over IMAP. Each run checks out with a fresh address on 'Catch-all domain' when set, otherwise with a unique plus-addressed alias of this address.",
             "editor": "textfield",
             "default": "wdmonitoring@gmail.com"
         },
@@ -153,6 +153,12 @@
             "description": "Google app password for the Gmail address (Google Account → Security → 2-Step Verification → App passwords). Required for the 'gmail' backend; used for IMAP polling only.",
             "editor": "textfield",
             "isSecret": true
+        },
+        "gmailAliasDomain": {
+            "title": "Catch-all domain for Gmail backend",
+            "type": "string",
+            "description": "Your own domain with a catch-all rule forwarding to the Gmail address above (e.g. Cloudflare Email Routing). When set, each run checks out with a fresh random address on this domain (e.g. emma.taylor4821@yourdomain.com). When empty, plus-aliases (you+123@gmail.com) are used, which IPTVV treats as the same email.",
+            "editor": "textfield"
         },
         "baseUrl": {
             "title": "IPTVV base URL",

@@ -26,6 +26,7 @@ _ENV_MAP = {
     "mailcxDomain": "MAILCX_DOMAIN",
     "gmailAddress": "IPTVV_GMAIL_ADDRESS",
     "gmailAppPassword": "IPTVV_GMAIL_APP_PASSWORD",
+    "gmailAliasDomain": "IPTVV_GMAIL_ALIAS_DOMAIN",
     "baseUrl": "IPTVV_BASE_URL",
     "emailMaxWaitSeconds": "IPTVV_EMAIL_MAX_WAIT_SECONDS",
     "emailPollSeconds": "IPTVV_EMAIL_POLL_SECONDS",

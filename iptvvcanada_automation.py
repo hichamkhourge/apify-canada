@@ -114,6 +114,10 @@ MAILCX_DOMAIN = os.getenv("MAILCX_DOMAIN", "").strip()
 IPTVV_GMAIL_ADDRESS = os.getenv("IPTVV_GMAIL_ADDRESS", "wdmonitoring@gmail.com").strip()
 IPTVV_GMAIL_APP_PASSWORD = os.getenv("IPTVV_GMAIL_APP_PASSWORD", "").strip()
 IPTVV_GMAIL_IMAP_HOST = os.getenv("IPTVV_GMAIL_IMAP_HOST", "imap.gmail.com")
+# Own domain with a catch-all forwarding to IPTVV_GMAIL_ADDRESS (e.g. Cloudflare
+# Email Routing). When set, each run uses a fresh random address on it instead
+# of a plus-alias, which IPTVV normalizes back to the base Gmail address.
+IPTVV_GMAIL_ALIAS_DOMAIN = os.getenv("IPTVV_GMAIL_ALIAS_DOMAIN", "").strip().lower().lstrip("@")
 AUTO_EXIT = os.getenv("AUTO_EXIT", "True").lower() == "true"
 IPTVV_PAGE_LOAD_RETRIES = int(os.getenv("IPTVV_PAGE_LOAD_RETRIES", "2"))
 IPTVV_TRIAL_PRODUCT_ID = os.getenv("IPTVV_TRIAL_PRODUCT_ID", "7758")
@@ -1010,11 +1014,28 @@ def verify_gmail_login():
         ) from exc
 
 
-def create_gmail_alias():
-    """Build a unique plus-addressed alias and verify the IMAP login up front.
+_ALIAS_FIRST_NAMES = [
+    "emma", "liam", "olivia", "noah", "ava", "lucas", "mia", "ethan", "chloe", "jacob",
+    "sophie", "nathan", "julia", "samuel", "laura", "daniel", "sarah", "thomas", "megan", "ryan",
+]
+_ALIAS_LAST_NAMES = [
+    "smith", "tremblay", "brown", "martin", "roy", "wilson", "gagnon", "taylor", "campbell",
+    "anderson", "lee", "white", "thompson", "clark", "walker", "young", "scott", "king",
+]
 
-    Returns the alias address (all mail still lands in IPTVV_GMAIL_ADDRESS),
-    or None on failure.
+
+def _random_person():
+    """A random (first, last) name pair used for the alias and billing name."""
+    return random.choice(_ALIAS_FIRST_NAMES), random.choice(_ALIAS_LAST_NAMES)
+
+
+def create_gmail_alias(first=None, last=None):
+    """Build a fresh receiving address and verify the IMAP login up front.
+
+    With IPTVV_GMAIL_ALIAS_DOMAIN set, returns a realistic random address on
+    that catch-all domain (e.g. emma.taylor4821@domain); otherwise a unique
+    plus-addressed alias of IPTVV_GMAIL_ADDRESS. Either way the mail lands in
+    IPTVV_GMAIL_ADDRESS. Returns None on failure.
     """
     try:
         if "@" not in IPTVV_GMAIL_ADDRESS:
@@ -1024,9 +1045,16 @@ def create_gmail_alias():
             imap.logout()
         except Exception:
             pass
-        local, domain = IPTVV_GMAIL_ADDRESS.split("@", 1)
-        suffix = f"{int(time.time())}{random.randint(100, 999)}"
-        alias = f"{local}+{suffix}@{domain}"
+        if IPTVV_GMAIL_ALIAS_DOMAIN:
+            if not (first and last):
+                first, last = _random_person()
+            sep = random.choice([".", "", "_"])
+            digits = str(random.randint(10, 9999))
+            alias = f"{first}{sep}{last}{digits}@{IPTVV_GMAIL_ALIAS_DOMAIN}"
+        else:
+            local, domain = IPTVV_GMAIL_ADDRESS.split("@", 1)
+            suffix = f"{int(time.time())}{random.randint(100, 999)}"
+            alias = f"{local}+{suffix}@{domain}"
         print(f"[OK] Gmail alias created: {alias}")
         return alias
     except Exception as exc:
@@ -1401,10 +1429,15 @@ def _create_session_for(backend):
         return {"backend": "procmail", "address": address}
 
     if backend == "gmail":
-        alias = create_gmail_alias()
+        first, last = _random_person()
+        alias = create_gmail_alias(first, last)
         if not alias:
             return None
-        return {"backend": "gmail", "address": alias}
+        session = {"backend": "gmail", "address": alias}
+        if IPTVV_GMAIL_ALIAS_DOMAIN:
+            # Billing name matches the address's name for a natural-looking order.
+            session["names"] = {"first_name": first.capitalize(), "last_name": last.capitalize()}
+        return session
 
     if backend == "mailcx":
         address = create_mailcx_inbox()
@@ -1777,9 +1810,13 @@ def navigate_to_cart_and_get_free_trial(driver):
         raise _translate_worker_error(driver, exc) from exc
 
 
-def fill_checkout_form(driver, email_address):
-    """Fill the WooCommerce checkout form with generated data and the given email."""
+def fill_checkout_form(driver, email_address, names=None):
+    """Fill the WooCommerce checkout form with generated data and the given email.
+
+    'names' ({first_name, last_name}) overrides the random billing name.
+    """
     user_data = generate_random_user_data()
+    user_data.update(names or {})
     user_data["email"] = email_address
     try:
         driver.fill(email_address, user_data)
@@ -2323,7 +2360,7 @@ def run_automation():
             email_address = email_session["address"]
 
             # Step 5: Fill checkout form with the temporary email
-            fill_checkout_form(driver, email_address)
+            fill_checkout_form(driver, email_address, email_session.get("names"))
 
             # Step 6: Submit form
             try:
