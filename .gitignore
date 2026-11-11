@@ -8,3 +8,4 @@ apify_storage/
 logs/
 *.png
 *.html
+browser/node_modules/

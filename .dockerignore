@@ -14,3 +14,4 @@ logs
 README.md
 # Cached IBO Player bearer token (secret, created at runtime).
 iboplayer_token_*.json
+node_modules
